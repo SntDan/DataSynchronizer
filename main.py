@@ -21,8 +21,8 @@ UI_TEXTS = {
         'lang_btn': 'English',
         'ready': '就绪。',
         'scanning': '扫描中...',
-        'scan_done': '扫描完成。共发现 {} 个差异项！',
-        'scan_prog': '已扫描 {} 个文件，发现差异 {} 项...',
+        'scan_done': '扫描完成。新增: {} 项，修改: {} 项，多余: {} 项',
+        'scan_prog': '已扫描 {} 个文件...',
         'start_sync': '准备开始同步...',
         'sync_prog': '同步中: {} / {}',
         'sync_done': '同步已全部完成！',
@@ -38,7 +38,7 @@ UI_TEXTS = {
         'browse_dst': '选择目标目录'
     },
     'en_US': {
-        'title': 'Data Synchronizer Pro',
+        'title': 'Data Synchronizer',
         'src_btn': 'Browse...',
         'src_label': 'Source Dir:',
         'dst_btn': 'Browse...',
@@ -49,8 +49,8 @@ UI_TEXTS = {
         'lang_btn': '中文',
         'ready': 'Ready.',
         'scanning': 'Scanning...',
-        'scan_done': 'Scan complete. Found {} difference(s)!',
-        'scan_prog': 'Scanned {} files, found {} difference(s)...',
+        'scan_done': 'Scan complete. New: {}, Modified: {}, Extra: {}',
+        'scan_prog': 'Scanned {} files...',
         'start_sync': 'Preparing to synchronize...',
         'sync_prog': 'Synchronizing: {} / {}',
         'sync_done': 'Synchronization complete!',
@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
         if total > 0:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(count)
-        self.status_label.setText(self.get_text('scan_prog', count, len(self.diff_data_full)))
+        self.status_label.setText(self.get_text('scan_prog', count))
 
     def on_scan_finished(self):
         self.scan_btn.setEnabled(True)
@@ -255,7 +255,12 @@ class MainWindow(QMainWindow):
             self.list_model.add_batch(self.diff_data_full)
 
         total_diffs = len(self.diff_data_full)
-        self.status_label.setText(self.get_text('scan_done', total_diffs))
+        
+        new_files = sum(1 for d in self.diff_data_full if d[0] == "NEW")
+        modified_files = sum(1 for d in self.diff_data_full if d[0] == "MODIFIED")
+        extra_files = sum(1 for d in self.diff_data_full if d[0] in ("EXTRA", "EXTRA_DIR"))
+        
+        self.status_label.setText(self.get_text('scan_done', new_files, modified_files, extra_files))
 
         if total_diffs > 0:
             self.sync_btn.setEnabled(True)
