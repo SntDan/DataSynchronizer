@@ -24,8 +24,39 @@ class SyncScanner(QObject):
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS file_snapshot 
-                            (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, file_hash TEXT)''')
+            # 检查旧表结构
+            cursor = conn.execute("PRAGMA table_info(file_snapshot)")
+            cols = {row[1] for row in cursor.fetchall()}
+
+            needs_rebuild = 'src_dir' not in cols or 'dst_dir' not in cols
+
+            if needs_rebuild and cols:
+                # 保留旧数据，迁移到新表
+                conn.execute("ALTER TABLE file_snapshot RENAME TO file_snapshot_old")
+                conn.execute('''CREATE TABLE file_snapshot (
+                    path TEXT,
+                    src_dir TEXT NOT NULL DEFAULT '',
+                    dst_dir TEXT NOT NULL DEFAULT '',
+                    size INTEGER,
+                    mtime REAL,
+                    file_hash TEXT,
+                    PRIMARY KEY (path, src_dir, dst_dir)
+                )''')
+                # 旧数据迁移（src_dir/dst_dir 填空字符串）
+                conn.execute('''INSERT OR IGNORE INTO file_snapshot (path, src_dir, dst_dir, size, mtime, file_hash)
+                                SELECT path, '', '', size, mtime, file_hash FROM file_snapshot_old''')
+                conn.execute("DROP TABLE file_snapshot_old")
+            else:
+                # 全新数据库，直接建表
+                conn.execute('''CREATE TABLE IF NOT EXISTS file_snapshot (
+                    path TEXT,
+                    src_dir TEXT NOT NULL DEFAULT '',
+                    dst_dir TEXT NOT NULL DEFAULT '',
+                    size INTEGER,
+                    mtime REAL,
+                    file_hash TEXT,
+                    PRIMARY KEY (path, src_dir, dst_dir)
+                )''')
                             
     def get_file_hash(self, filepath):
         x = xxhash.xxh64()
