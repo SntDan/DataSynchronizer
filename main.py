@@ -10,7 +10,7 @@ from copy_manager import CopyManager
 
 UI_TEXTS = {
     'zh_CN': {
-        'title': 'Data Synchronizer',
+        'title': 'DataSynchronizer',
         'src_btn': '浏览...',
         'src_label': '源目录设置:',
         'dst_btn': '浏览...',
@@ -38,7 +38,7 @@ UI_TEXTS = {
         'browse_dst': '选择目标目录'
     },
     'en_US': {
-        'title': 'Data Synchronizer',
+        'title': 'DataSynchronizer',
         'src_btn': 'Browse...',
         'src_label': 'Source Dir:',
         'dst_btn': 'Browse...',
