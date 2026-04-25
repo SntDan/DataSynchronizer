@@ -1,5 +1,12 @@
-﻿from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex
+from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex
 from PySide6.QtGui import QColor
+
+# 性能：颜色对象在模块级创建一次，避免 data() 每次调用时新建 QColor
+_COLOR_GREEN = QColor("green")
+_COLOR_ORANGE = QColor("orange")
+_COLOR_RED = QColor("red")
+_COLOR_GRAY = QColor("gray")
+
 
 class TreeNode:
     __slots__ = ('name', 'parent', 'children', 'children_dict', 'status', 'size', 
@@ -32,7 +39,8 @@ class TreeNode:
         sync_children = []
         extra_children = []
         for c in self.children:
-            if getattr(c, 'is_ellipsis_extra', False) or getattr(c, 'is_ellipsis_sync', False):
+            # __slots__ 已声明，可直接访问
+            if c.is_ellipsis_extra or c.is_ellipsis_sync:
                 continue
             if c.status in ("EXTRA", "EXTRA_DIR"):
                 extra_children.append(c)
@@ -62,23 +70,21 @@ class TreeNode:
         return self._cached_visible
 
     def add_child(self, path_parts, status, size, rel_path):
-        if not path_parts:
-            return
-        
-        part = path_parts[0]
-        node = self.children_dict.get(part)
-        if node is None:
-            node = TreeNode(part, self)
-            self.children.append(node)
-            self.children_dict[part] = node
-            self._cached_visible = None
-        
-        if len(path_parts) == 1:
-            node.status = status
-            node.size = size
-            node.rel_path = rel_path
-        else:
-            node.add_child(path_parts[1:], status, size, rel_path)
+        # 性能：迭代式插入，避免每层一次 Python 函数调用
+        node = self
+        last_idx = len(path_parts) - 1
+        for i, part in enumerate(path_parts):
+            child = node.children_dict.get(part)
+            if child is None:
+                child = TreeNode(part, node)
+                node.children.append(child)
+                node.children_dict[part] = child
+                node._cached_visible = None
+            if i == last_idx:
+                child.status = status
+                child.size = size
+                child.rel_path = rel_path
+            node = child
 
     def row(self):
         if self.parent:
@@ -102,9 +108,10 @@ class DiffTreeModel(QAbstractItemModel):
 
     def add_batch(self, diffs):
         self.beginResetModel()
+        root_add = self.rootItem.add_child
         for status, rel_path, abs_path, size in diffs:
             parts = rel_path.replace('\\', '/').split('/')
-            self.rootItem.add_child(parts, status, size, rel_path)
+            root_add(parts, status, size, rel_path)
         self.endResetModel()
 
     def clear(self):
@@ -144,38 +151,39 @@ class DiffTreeModel(QAbstractItemModel):
         if not index.isValid(): return None
         item = index.internalPointer()
         if role == Qt.DisplayRole:
-            if getattr(item, 'is_ellipsis_sync', False) or getattr(item, 'is_ellipsis_extra', False):
+            if item.is_ellipsis_sync or item.is_ellipsis_extra:
                 return item.name
-            if item.status:
+            status = item.status
+            if status:
                 # 不对 EXTRA_DIR 的文件夹 或者 包含子文件的文件夹显示大小
-                if item.status == "EXTRA_DIR" or len(item.children) > 0:
-                    return f"[{item.status}] {item.name}"
-                return f"[{item.status}] {item.name} ({item.size} bytes)"
+                if status == "EXTRA_DIR" or item.children:
+                    return f"[{status}] {item.name}"
+                return f"[{status}] {item.name} ({item.size} bytes)"
             else:
                 return f"[DIR] {item.name}"
         elif role == Qt.ForegroundRole:
-            if getattr(item, 'is_ellipsis_sync', False) or getattr(item, 'is_ellipsis_extra', False):
-                return QColor("gray")
-            if item.status == "NEW": return QColor("green")
-            elif item.status == "MODIFIED": return QColor("orange")
-            elif item.status in ("CONFLICT", "EXTRA", "EXTRA_DIR"): 
-                if self.is_mirror_mode:
-                    return QColor("red")
-                else:
-                    return QColor("gray")
+            if item.is_ellipsis_sync or item.is_ellipsis_extra:
+                return _COLOR_GRAY
+            status = item.status
+            if status == "NEW":
+                return _COLOR_GREEN
+            elif status == "MODIFIED":
+                return _COLOR_ORANGE
+            elif status == "EXTRA" or status == "EXTRA_DIR" or status == "CONFLICT":
+                return _COLOR_RED if self.is_mirror_mode else _COLOR_GRAY
         return None
 
     def expand_ellipsis(self, index):
         if not index.isValid(): return False
         item = index.internalPointer()
-        if getattr(item, 'is_ellipsis_sync', False) or getattr(item, 'is_ellipsis_extra', False):
+        if item.is_ellipsis_sync or item.is_ellipsis_extra:
             parentItem = item.parent
             self.layoutAboutToBeChanged.emit()
-            if getattr(item, 'is_ellipsis_sync', False):
+            if item.is_ellipsis_sync:
                 parentItem.is_truncated_sync = False
-            elif getattr(item, 'is_ellipsis_extra', False):
+            elif item.is_ellipsis_extra:
                 parentItem.is_truncated_extra = False
-            parentItem._cached_visible = None # Invalidate cache
+            parentItem._cached_visible = None  # Invalidate cache
             self.layoutChanged.emit()
             return True
         return False

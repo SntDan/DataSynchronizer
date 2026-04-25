@@ -1,7 +1,6 @@
-﻿import os
+import os
 import sqlite3
 import xxhash
-from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QObject, Signal
 
 IGNORED_FILENAMES = {
@@ -24,6 +23,13 @@ class SyncScanner(QObject):
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # 性能：开启 WAL，写入 fsync 频率显著降低；并发读写更友好
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.DatabaseError:
+                pass
+
             # 检查旧表结构
             cursor = conn.execute("PRAGMA table_info(file_snapshot)")
             cols = {row[1] for row in cursor.fetchall()}
@@ -57,7 +63,7 @@ class SyncScanner(QObject):
                     file_hash TEXT,
                     PRIMARY KEY (path, src_dir, dst_dir)
                 )''')
-                            
+
     def get_file_hash(self, filepath):
         x = xxhash.xxh64()
         try:
@@ -68,32 +74,47 @@ class SyncScanner(QObject):
         except OSError:
             return None
 
-    def scan_and_compare(self, source_dir, target_dir, use_deep_hash=False):
-        snapshots = {}
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("SELECT path, size, mtime, file_hash FROM file_snapshot")
-            for row in cursor:
-                snapshots[row[0]] = {'size': row[1], 'mtime': row[2], 'hash': row[3]}
-
-        # 进行一轮快速扫描以获取总文件数量（为了真实的进度条）
-        total_files_to_scan = 0
-        def count_files(path):
-            count = 0
+    @staticmethod
+    def _count_files_iter(root):
+        """迭代式统计文件数，避免递归调用栈与函数开销。"""
+        if not os.path.exists(root):
+            return 0
+        count = 0
+        stack = [root]
+        while stack:
+            path = stack.pop()
             try:
                 with os.scandir(path) as it:
                     for entry in it:
-                        if entry.is_dir(follow_symlinks=False):
-                            count += count_files(entry.path)
-                        else:
-                            count += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            else:
+                                count += 1
+                        except OSError:
+                            continue
             except OSError:
                 pass
-            return count
+        return count
 
+    def scan_and_compare(self, source_dir, target_dir, use_deep_hash=False):
+        # 性能：按 src/dst 过滤快照，避免加载无关数据；元组比 dict 更轻
+        snapshots = {}
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT path, size, mtime, file_hash FROM file_snapshot "
+                "WHERE src_dir=? AND dst_dir=?",
+                (source_dir, target_dir)
+            )
+            for row in cursor:
+                snapshots[row[0]] = (row[1], row[2], row[3])
+
+        # 进行一轮快速扫描以获取总文件数量（为了真实的进度条）
+        total_files_to_scan = 0
         if os.path.exists(source_dir):
-            total_files_to_scan += count_files(source_dir)
+            total_files_to_scan += self._count_files_iter(source_dir)
         if os.path.exists(target_dir):
-            total_files_to_scan += count_files(target_dir)
+            total_files_to_scan += self._count_files_iter(target_dir)
 
         if total_files_to_scan == 0:
             total_files_to_scan = 1  # 避免除以0
@@ -102,104 +123,139 @@ class SyncScanner(QObject):
         scanned_count = 0
         source_rel_paths = set()
         source_dirs = set()
-        
-        def scan_dir(path):
-            nonlocal scanned_count, diff_results
-            dirs_to_visit = []
-            try:
-                with os.scandir(path) as it:
-                    for entry in it:
-                        if entry.is_dir(follow_symlinks=False):
-                            source_dirs.add(os.path.relpath(entry.path, source_dir))    
-                            dirs_to_visit.append(entry.path)
-                        elif entry.is_file(follow_symlinks=False):
-                            if entry.name in IGNORED_FILENAMES:
+
+        # 性能：把热路径上反复用到的属性 / 全局解析为本地变量
+        sep = os.sep
+        ignored = IGNORED_FILENAMES
+        diff_emit = self.diff_batch_found.emit
+        progress_emit = self.progress_updated.emit
+        path_join = os.path.join
+        path_exists = os.path.exists
+        path_getsize = os.path.getsize
+        os_stat = os.stat
+        get_hash = self.get_file_hash
+
+        # ===== 主扫描：源目录（迭代式，手动维护相对前缀，免掉每文件 relpath 开销） =====
+        if os.path.exists(source_dir):
+            # stack 元素: (绝对路径, 相对前缀)；相对前缀 "" 表示就是 source_dir 自身
+            stack = [(source_dir, "")]
+            while stack:
+                cur_path, cur_rel = stack.pop()
+                try:
+                    with os.scandir(cur_path) as it:
+                        for entry in it:
+                            name = entry.name
+                            if cur_rel:
+                                entry_rel = cur_rel + sep + name
+                            else:
+                                entry_rel = name
+
+                            try:
+                                is_dir = entry.is_dir(follow_symlinks=False)
+                            except OSError:
                                 continue
-                            stat = entry.stat()
-                            rel_path = os.path.relpath(entry.path, source_dir)
-                            source_rel_paths.add(rel_path)
-                            target_path = os.path.join(target_dir, rel_path)
+
+                            if is_dir:
+                                source_dirs.add(entry_rel)
+                                stack.append((entry.path, entry_rel))
+                                continue
+
+                            if name in ignored:
+                                continue
+
+                            try:
+                                stat = entry.stat()
+                            except OSError:
+                                continue
+
+                            st_size = stat.st_size
+                            st_mtime = stat.st_mtime
+                            source_rel_paths.add(entry_rel)
+                            target_path = path_join(target_dir, entry_rel)
 
                             status = None
-                            snap = snapshots.get(rel_path)
+                            snap = snapshots.get(entry_rel)
 
-                            if not snap:
-                                if os.path.exists(target_path):
-                                    if os.path.getsize(target_path) != stat.st_size:    
+                            if snap is None:
+                                if path_exists(target_path):
+                                    if path_getsize(target_path) != st_size:
                                         status = "MODIFIED"
                                 else:
                                     status = "NEW"
                             else:
-                                if snap['size'] != stat.st_size or snap['mtime'] < stat.st_mtime:
+                                snap_size, snap_mtime, snap_hash = snap
+                                if snap_size != st_size or snap_mtime < st_mtime:
                                     if use_deep_hash:
-                                        current_hash = self.get_file_hash(entry.path)   
-                                        if current_hash != snap['hash']:
+                                        if get_hash(entry.path) != snap_hash:
                                             status = "MODIFIED"
                                     else:
                                         status = "MODIFIED"
                                 else:
                                     try:
-                                        target_stat = os.stat(target_path)
-                                        if target_stat.st_size != stat.st_size:
+                                        if os_stat(target_path).st_size != st_size:
                                             status = "MODIFIED"
                                     except OSError:
                                         status = "NEW"
 
-                            if status in ["NEW", "MODIFIED", "CONFLICT"]:
-                                diff_results.append((status, rel_path, entry.path, stat.st_size))
+                            if status:
+                                diff_results.append((status, entry_rel, entry.path, st_size))
                                 if len(diff_results) >= 1000:
-                                    self.diff_batch_found.emit(diff_results)
+                                    diff_emit(diff_results)
                                     diff_results = []
 
                             scanned_count += 1
                             if scanned_count % 500 == 0:
-                                self.progress_updated.emit(scanned_count, total_files_to_scan)
-            except OSError:
-                pass
-            
-            for d in dirs_to_visit:
-                scan_dir(d)
-
-        if os.path.exists(source_dir):
-            scan_dir(source_dir)
-
-        # 无论是否打开"删除多余文件"模式，都要对比并寻找多余的内容（供UI呈现）
-        if os.path.exists(target_dir):
-            def scan_target(path):
-                nonlocal scanned_count, diff_results
-                dirs_to_visit = []
-                try:
-                    with os.scandir(path) as it:
-                        for entry in it:
-                            if entry.is_dir(follow_symlinks=False):
-                                rel_path = os.path.relpath(entry.path, target_dir)  
-                                if rel_path not in source_dirs and rel_path != '.': 
-                                    diff_results.append(("EXTRA_DIR", rel_path, entry.path, 0))
-                                    if len(diff_results) >= 1000:
-                                        self.diff_batch_found.emit(diff_results)    
-                                        diff_results = []
-                                # 无论是不是多余文件夹，都往下扫描以展现给用户它的内部结构
-                                dirs_to_visit.append(entry.path)
-                            elif entry.is_file(follow_symlinks=False):
-                                if entry.name in IGNORED_FILENAMES:
-                                    continue
-                                rel_path = os.path.relpath(entry.path, target_dir)
-                                if rel_path not in source_rel_paths:
-                                    diff_results.append(("EXTRA", rel_path, entry.path, entry.stat().st_size))
-                                    if len(diff_results) >= 1000:
-                                        self.diff_batch_found.emit(diff_results)
-                                        diff_results = []
-                                
-                                scanned_count += 1
-                                if scanned_count % 500 == 0:
-                                    self.progress_updated.emit(scanned_count, total_files_to_scan)
+                                progress_emit(scanned_count, total_files_to_scan)
                 except OSError:
-                    pass
-                
-                for d in dirs_to_visit:
-                    scan_target(d)
+                    continue
 
-            scan_target(target_dir)
+        # ===== 主扫描：目标目录，找 EXTRA / EXTRA_DIR =====
+        if os.path.exists(target_dir):
+            stack = [(target_dir, "")]
+            while stack:
+                cur_path, cur_rel = stack.pop()
+                try:
+                    with os.scandir(cur_path) as it:
+                        for entry in it:
+                            name = entry.name
+                            if cur_rel:
+                                entry_rel = cur_rel + sep + name
+                            else:
+                                entry_rel = name
+
+                            try:
+                                is_dir = entry.is_dir(follow_symlinks=False)
+                            except OSError:
+                                continue
+
+                            if is_dir:
+                                if entry_rel not in source_dirs:
+                                    diff_results.append(("EXTRA_DIR", entry_rel, entry.path, 0))
+                                    if len(diff_results) >= 1000:
+                                        diff_emit(diff_results)
+                                        diff_results = []
+                                # 不论是否多余，都向下扫描以呈现内部结构
+                                stack.append((entry.path, entry_rel))
+                                continue
+
+                            if name in ignored:
+                                continue
+
+                            if entry_rel not in source_rel_paths:
+                                try:
+                                    file_size = entry.stat().st_size
+                                except OSError:
+                                    file_size = 0
+                                diff_results.append(("EXTRA", entry_rel, entry.path, file_size))
+                                if len(diff_results) >= 1000:
+                                    diff_emit(diff_results)
+                                    diff_results = []
+
+                            scanned_count += 1
+                            if scanned_count % 500 == 0:
+                                progress_emit(scanned_count, total_files_to_scan)
+                except OSError:
+                    continue
 
         if diff_results:
-            self.diff_batch_found.emit(diff_results)
+            diff_emit(diff_results)

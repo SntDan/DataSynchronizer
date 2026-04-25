@@ -14,6 +14,13 @@ class CopyManager(QObject):
         super().__init__()
         self.db_path = db_path
         self.max_workers = 2
+        # 一次性应用到全局 DB（WAL 是持久化设置，但每次确认无害）
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass
 
     def _get_file_hash(self, filepath):
         x = xxhash.xxh64()
@@ -38,18 +45,22 @@ class CopyManager(QObject):
                 extra_dir_prefixes.add(norm)
 
         filtered = []
-        for item in diff_results:
-            status, rel_path, abs_path, size = item
-            if status in ("EXTRA", "EXTRA_DIR"):
-                norm = rel_path.replace('\\', '/')
-                # 如果这条记录的路径是某个 EXTRA_DIR 的子路径，跳过
-                is_child = any(
-                    norm != prefix and norm.startswith(prefix + '/')
-                    for prefix in extra_dir_prefixes
-                )
-                if is_child:
-                    continue
-            filtered.append(item)
+        if extra_dir_prefixes:
+            # 仅当存在 EXTRA_DIR 时才做 startswith 检查
+            for item in diff_results:
+                status, rel_path, abs_path, size = item
+                if status in ("EXTRA", "EXTRA_DIR"):
+                    norm = rel_path.replace('\\', '/')
+                    is_child = False
+                    for prefix in extra_dir_prefixes:
+                        if norm != prefix and norm.startswith(prefix + '/'):
+                            is_child = True
+                            break
+                    if is_child:
+                        continue
+                filtered.append(item)
+        else:
+            filtered = list(diff_results)
 
         self.diff_results = filtered
         self.total_files = len(filtered)
@@ -145,18 +156,30 @@ class CopyManager(QObject):
                 return
 
         try:
+            # 性能：边写边算 hash —— 避免拷贝结束后再读一遍源文件
+            # 续传场景下前段字节没经过 hasher，这种情况退回独立计算
+            x = xxhash.xxh64()
+            inline_hash = (copied_bytes == 0)
+            last_emit_percent = -1
+            file_progress_emit = self.current_file_progress.emit
+
             with open(source_path, 'rb') as src, open(target_path, mode) as dst:
                 src.seek(copied_bytes)
                 while chunk := src.read(chunk_size):
+                    if inline_hash:
+                        x.update(chunk)
                     dst.write(chunk)
                     copied_bytes += len(chunk)
                     if size > 0:
+                        # 性能：仅在百分比变化时才发射，4MB 块下最多 101 次
                         percent = int((copied_bytes / size) * 100)
-                        self.current_file_progress.emit(rel_path, percent)
+                        if percent != last_emit_percent:
+                            file_progress_emit(rel_path, percent)
+                            last_emit_percent = percent
 
             shutil.copystat(source_path, target_path)
-            # 复制完成后计算哈希并写入快照，供下次深度校验使用
-            file_hash = self._get_file_hash(source_path)
+
+            file_hash = x.hexdigest() if inline_hash else self._get_file_hash(source_path)
             self._update_db_snapshot(rel_path, size, os.path.getmtime(source_path), file_hash)
 
         except Exception as e:

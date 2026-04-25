@@ -255,11 +255,18 @@ class MainWindow(QMainWindow):
             self.list_model.add_batch(self.diff_data_full)
 
         total_diffs = len(self.diff_data_full)
-        
-        new_files = sum(1 for d in self.diff_data_full if d[0] == "NEW")
-        modified_files = sum(1 for d in self.diff_data_full if d[0] == "MODIFIED")
-        extra_files = sum(1 for d in self.diff_data_full if d[0] in ("EXTRA", "EXTRA_DIR"))
-        
+
+        # 性能：单次遍历完成所有计数
+        new_files = modified_files = extra_files = 0
+        for d in self.diff_data_full:
+            s = d[0]
+            if s == "NEW":
+                new_files += 1
+            elif s == "MODIFIED":
+                modified_files += 1
+            elif s == "EXTRA" or s == "EXTRA_DIR":
+                extra_files += 1
+
         self.status_label.setText(self.get_text('scan_done', new_files, modified_files, extra_files))
 
         if total_diffs > 0:
@@ -286,10 +293,18 @@ class MainWindow(QMainWindow):
             pass
 
     def start_sync(self):
-        new_files = sum(1 for d in self.diff_data_full if d[0] == "NEW")
-        modified_files = sum(1 for d in self.diff_data_full if d[0] == "MODIFIED")
-        extra_files = sum(1 for d in self.diff_data_full if d[0] == "EXTRA")
-        extra_dirs = sum(1 for d in self.diff_data_full if d[0] == "EXTRA_DIR")
+        # 性能：单次遍历完成所有计数
+        new_files = modified_files = extra_files = extra_dirs = 0
+        for d in self.diff_data_full:
+            s = d[0]
+            if s == "NEW":
+                new_files += 1
+            elif s == "MODIFIED":
+                modified_files += 1
+            elif s == "EXTRA":
+                extra_files += 1
+            elif s == "EXTRA_DIR":
+                extra_dirs += 1
 
         is_mirror = self.mirror_checkbox.isChecked()
 
