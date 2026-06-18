@@ -3,7 +3,7 @@ import shutil
 import sqlite3
 import stat
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
 
 import xxhash
@@ -20,6 +20,7 @@ class CopyManager(QObject):
         self.db_path = db_path
         self.max_workers = max(1, int(max_workers))
         self._progress_lock = threading.Lock()
+        self._cancel_event = threading.Event()
         self.is_syncing = False
         try:
             with closing(sqlite3.connect(self.db_path)) as conn, conn:
@@ -49,6 +50,7 @@ class CopyManager(QObject):
         return False
 
     def start_sync(self, diff_results, mirror_mode=False):
+        self._cancel_event.clear()
         extra_dirs_by_pair = {}
         for item in diff_results:
             if item[0] == "EXTRA_DIR":
@@ -86,15 +88,52 @@ class CopyManager(QObject):
         db_operations = []
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                for operation in pool.map(
-                    self._copy_single_file, self.diff_results
-                ):
-                    if operation is not None:
-                        db_operations.append(operation)
-            self._apply_db_operations(db_operations)
+                items = iter(self.diff_results)
+                pending = set()
+
+                def submit_next():
+                    if self._cancel_event.is_set():
+                        return False
+                    try:
+                        item = next(items)
+                    except StopIteration:
+                        return False
+                    pending.add(pool.submit(self._copy_single_file, item))
+                    return True
+
+                for _ in range(self.max_workers * 2):
+                    if not submit_next():
+                        break
+
+                while pending:
+                    completed, pending = wait(
+                        pending, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
+                        operation = future.result()
+                        if operation is not None:
+                            db_operations.append(operation)
+                        submit_next()
+
+                    if len(db_operations) >= 1000:
+                        self._apply_db_operations(db_operations)
+                        db_operations.clear()
+
+            if db_operations:
+                self._apply_db_operations(db_operations)
         finally:
             self.is_syncing = False
             self.copy_finished.emit()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def wait_for_finished(self, timeout=3.0):
+        worker = getattr(self, "worker_thread", None)
+        if worker is None:
+            return True
+        worker.join(timeout)
+        return not worker.is_alive()
 
     def _advance_progress(self):
         with self._progress_lock:
@@ -116,6 +155,8 @@ class CopyManager(QObject):
         normalized_rel = rel_path.replace("\\", "/")
 
         try:
+            if self._cancel_event.is_set():
+                return None
             if status in ("EXTRA", "EXTRA_DIR"):
                 if not self.mirror_mode:
                     return None
@@ -172,6 +213,8 @@ class CopyManager(QObject):
             ) as dst:
                 src.seek(copied_bytes)
                 while chunk := src.read(4 * 1024 * 1024):
+                    if self._cancel_event.is_set():
+                        return None
                     if inline_hash:
                         hasher.update(chunk)
                     dst.write(chunk)

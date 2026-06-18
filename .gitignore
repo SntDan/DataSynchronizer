@@ -3,3 +3,6 @@ sync_snapshot.db
 sync_snapshot.db-shm
 sync_snapshot.db-wal
 *.json
+/build
+*.spec
+/dist

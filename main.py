@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -31,7 +32,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-CONFIG_PATH = APP_DIR / "sync_config.json"
+CONFIG_PATH = APP_DIR / "config.json"
 DB_PATH = APP_DIR / "sync_snapshot.db"
 
 
@@ -75,7 +76,6 @@ UI_TEXTS = {
         "warn_target": "无法创建目标目录：\n{}",
         "warn_same": "第 {} 组的源目录和目标目录不能相同。",
         "scan_error": "扫描失败：\n{}",
-        "config_error": "配置文件读取失败，将使用空配置：\n{}",
         "done_title": "成功",
         "browse_src": "选择源目录",
         "browse_dst": "选择目标目录",
@@ -122,7 +122,6 @@ UI_TEXTS = {
         "warn_target": "Could not create target directory:\n{}",
         "warn_same": "Source and target in pair {} cannot be the same.",
         "scan_error": "Scan failed:\n{}",
-        "config_error": "Could not read the config; using an empty one:\n{}",
         "done_title": "Success",
         "browse_src": "Select Source Directory",
         "browse_dst": "Select Target Directory",
@@ -135,6 +134,11 @@ UI_TEXTS = {
 
 
 def load_config():
+    default_config = {
+        "source_directories": [],
+        "target_directories": [],
+        "copy_workers": 4,
+    }
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
@@ -149,13 +153,17 @@ def load_config():
             "source_directories": [str(path) for path in sources if path],
             "target_directories": [str(path) for path in targets if path],
             "copy_workers": max(1, int(workers)),
-        }, None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        return {
-            "source_directories": [],
-            "target_directories": [],
-            "copy_workers": 4,
-        }, str(exc)
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(default_config, ensure_ascii=False, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return default_config
 
 
 class SyncWorker(QThread):
@@ -167,6 +175,10 @@ class SyncWorker(QThread):
         self.scanner = scanner
         self.directory_pairs = directory_pairs
         self.deep_hash = deep_hash
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
 
     def run(self):
         total = len(self.directory_pairs)
@@ -174,12 +186,15 @@ class SyncWorker(QThread):
             for index, (source_dir, target_dir) in enumerate(
                 self.directory_pairs
             ):
+                if self.cancel_event.is_set():
+                    return
                 self.pair_started.emit(index + 1, total)
                 self.scanner.scan_and_compare(
                     source_dir,
                     target_dir,
                     self.deep_hash,
                     pair_index=index,
+                    cancel_event=self.cancel_event,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -195,19 +210,13 @@ class MainWindow(QMainWindow):
         self.current_scan_pair = 1
         self.total_scan_pairs = 1
         self.scan_error = None
-        self.config, config_error = load_config()
+        self._closing = False
+        self.config = load_config()
 
         self.init_ui()
         self.init_logic()
         self.load_default_paths()
         self.update_ui_texts()
-
-        if config_error:
-            QMessageBox.warning(
-                self,
-                self.get_text("warn_title"),
-                self.get_text("config_error", config_error),
-            )
 
     def get_text(self, key, *args):
         text = UI_TEXTS[self.current_lang].get(key, key)
@@ -539,6 +548,8 @@ class MainWindow(QMainWindow):
         self.scan_error = message
 
     def on_scan_finished(self):
+        if self._closing:
+            return
         self.scan_btn.setEnabled(True)
         if self.scan_error:
             self.status_label.setText(
@@ -644,6 +655,8 @@ class MainWindow(QMainWindow):
         pass
 
     def on_copy_finished(self):
+        if self._closing:
+            return
         self.status_label.setText(self.get_text("sync_done"))
         self.scan_btn.setEnabled(True)
         self.sync_btn.setEnabled(False)
@@ -654,23 +667,24 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        self._closing = True
+        self.save_config()
         scan_running = (
             hasattr(self, "scan_worker") and self.scan_worker.isRunning()
         )
-        if scan_running or self.copy_mgr.is_syncing:
-            QMessageBox.warning(
-                self,
-                self.get_text("warn_title"),
-                self.get_text("busy_close"),
-            )
-            event.ignore()
-            return
-        self.save_config()
+        if scan_running:
+            self.scan_worker.cancel()
+            self.scan_worker.wait(3000)
+        if self.copy_mgr.is_syncing:
+            self.copy_mgr.cancel()
+            self.copy_mgr.wait_for_finished(3.0)
         event.accept()
+        QApplication.quit()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    os._exit(exit_code)

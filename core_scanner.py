@@ -92,7 +92,11 @@ class SyncScanner(QObject):
         target_dir,
         use_deep_hash=False,
         pair_index=0,
+        cancel_event=None,
     ):
+        is_cancelled = (
+            cancel_event.is_set if cancel_event is not None else lambda: False
+        )
         snapshots = {}
         with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.execute(
@@ -132,10 +136,14 @@ class SyncScanner(QObject):
         if os.path.isdir(source_dir):
             stack = [(source_dir, "")]
             while stack:
+                if is_cancelled():
+                    return
                 current_path, current_rel = stack.pop()
                 try:
                     with os.scandir(current_path) as entries:
                         for entry in entries:
+                            if is_cancelled():
+                                return
                             rel_path = (
                                 current_rel + separator + entry.name
                                 if current_rel
@@ -211,10 +219,14 @@ class SyncScanner(QObject):
         if os.path.isdir(target_dir):
             stack = [(target_dir, "")]
             while stack:
+                if is_cancelled():
+                    return
                 current_path, current_rel = stack.pop()
                 try:
                     with os.scandir(current_path) as entries:
                         for entry in entries:
+                            if is_cancelled():
+                                return
                             rel_path = (
                                 current_rel + separator + entry.name
                                 if current_rel
@@ -232,6 +244,10 @@ class SyncScanner(QObject):
                                     add_difference(
                                         "EXTRA_DIR", rel_path, entry.path, 0
                                     )
+                                    # One parent entry is enough for mirror deletion.
+                                    # Skipping its subtree avoids a potentially huge
+                                    # second traversal of data absent from the source.
+                                    continue
                                 stack.append((entry.path, rel_path))
                                 continue
                             if entry.name in IGNORED_FILENAMES:
