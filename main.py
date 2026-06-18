@@ -3,20 +3,23 @@ import os
 import sys
 import threading
 from pathlib import Path
+from itertools import zip_longest
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -39,6 +42,14 @@ DB_PATH = APP_DIR / "sync_snapshot.db"
 UI_TEXTS = {
     "zh_CN": {
         "title": "DataSynchronizer",
+        "group_label": "第{}组",
+        "source_short": "源: ",
+        "target_short": "目标: ",
+        "source_placeholder": "源目录",
+        "target_placeholder": "目标目录",
+        "change_btn": "更改",
+        "add_group_btn": "添加组",
+        "remove_group_btn": "删除组",
         "src_btn": "添加",
         "clear_btn": "清空",
         "src_label": "源目录:",
@@ -83,14 +94,22 @@ UI_TEXTS = {
     },
     "en_US": {
         "title": "DataSynchronizer",
+        "group_label": "Group {}",
+        "source_short": "Src:",
+        "target_short": "Dst:",
+        "source_placeholder": "Source directory",
+        "target_placeholder": "Target directory",
+        "change_btn": "Edit",
+        "add_group_btn": "Add Grp",
+        "remove_group_btn": "Del Grp",
         "src_btn": "Add",
         "clear_btn": "Clear",
         "src_label": "Sources:",
         "dst_btn": "Add",
         "dst_label": "Targets:",
         "mirror_chk": "Remove extras",
-        "scan_btn": "1. Scan Differences",
-        "sync_btn": "2. Start Synchronization",
+        "scan_btn": "1. Scan",
+        "sync_btn": "2. Sync",
         "lang_btn": "中文",
         "ready": "Ready",
         "scanning": "Scanning pair {} / {}",
@@ -135,35 +154,60 @@ UI_TEXTS = {
 
 def load_config():
     default_config = {
-        "source_directories": [],
-        "target_directories": [],
+        "directory_pairs": [],
         "copy_workers": 4,
     }
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
-        sources = data.get("source_directories", [])
-        targets = data.get("target_directories", [])
         workers = data.get("copy_workers", 4)
-        if not isinstance(sources, list) or not isinstance(targets, list):
-            raise ValueError(
-                "source_directories and target_directories must be arrays"
+        raw_pairs = data.get("directory_pairs")
+        migrated = raw_pairs is None
+        if migrated:
+            sources = data.get("source_directories", [])
+            targets = data.get("target_directories", [])
+            if not isinstance(sources, list) or not isinstance(targets, list):
+                raise ValueError("invalid directory configuration")
+            raw_pairs = [
+                {"source": source or "", "target": target or ""}
+                for source, target in zip_longest(
+                    sources, targets, fillvalue=""
+                )
+            ]
+        if not isinstance(raw_pairs, list):
+            raise ValueError("directory_pairs must be an array")
+
+        pairs = []
+        for pair in raw_pairs:
+            if not isinstance(pair, dict):
+                raise ValueError("each directory pair must be an object")
+            pairs.append(
+                {
+                    "source": str(pair.get("source", "")),
+                    "target": str(pair.get("target", "")),
+                }
             )
-        return {
-            "source_directories": [str(path) for path in sources if path],
-            "target_directories": [str(path) for path in targets if path],
+
+        config = {
+            "directory_pairs": pairs,
             "copy_workers": max(1, int(workers)),
         }
+        if migrated:
+            _write_config(config)
+        return config
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        try:
-            CONFIG_PATH.write_text(
-                json.dumps(default_config, ensure_ascii=False, indent=2)
-                + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+        _write_config(default_config)
         return default_config
+
+
+def _write_config(data):
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 class SyncWorker(QThread):
@@ -225,55 +269,41 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         central_widget = QWidget()
         central_widget.setStyleSheet(
-            "QLabel, QCheckBox, QPlainTextEdit { font-size: 10pt; }"
+            "QLabel, QCheckBox, QLineEdit { font-size: 10pt; }"
             "QPushButton { font-size: 10pt; }"
         )
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        path_layout = QGridLayout()
-        path_layout.setHorizontalSpacing(8)
-        path_layout.setVerticalSpacing(8)
 
-        self.src_label = QLabel()
-        self.src_label.setFixedWidth(68)
-        self.src_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.src_input = self._create_path_editor()
-        self.src_btn = QPushButton()
-        self.src_btn.clicked.connect(self.select_source)
-        self.src_clear_btn = QPushButton()
-        self.src_clear_btn.clicked.connect(self.src_input.clear)
+        self.path_rows = []
+        self.add_group_btn = QPushButton()
+        self.add_group_btn.setFixedSize(96, 30)
+        self.add_group_btn.clicked.connect(
+            lambda: self.add_directory_group()
+        )
+        self.brand_label = QLabel(" DataSynchronizer")
+        self.brand_label.setStyleSheet(
+            "QLabel { font-size: 15pt; font-weight: 700; }"
+        )
+        top_toolbar = QHBoxLayout()
+        top_toolbar.setContentsMargins(0, 0, 8, 0)
+        top_toolbar.setSpacing(8)
+        top_toolbar.addWidget(self.brand_label)
+        top_toolbar.addStretch()
+        top_toolbar.addWidget(self.add_group_btn)
 
-        self.dst_label = QLabel()
-        self.dst_label.setFixedWidth(68)
-        self.dst_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.dst_input = self._create_path_editor()
-        self.dst_btn = QPushButton()
-        self.dst_btn.clicked.connect(self.select_target)
-        self.dst_clear_btn = QPushButton()
-        self.dst_clear_btn.clicked.connect(self.dst_input.clear)
-
-        for button in (
-            self.src_btn,
-            self.src_clear_btn,
-            self.dst_btn,
-            self.dst_clear_btn,
-        ):
-            button.setFixedHeight(30)
-        self.src_btn.setFixedWidth(82)
-        self.dst_btn.setFixedWidth(82)
-        self.src_clear_btn.setFixedWidth(82)
-        self.dst_clear_btn.setFixedWidth(82)
-
-        path_layout.addWidget(self.src_label, 0, 0)
-        path_layout.addWidget(self.src_input, 0, 1)
-        path_layout.addWidget(self.src_btn, 0, 2)
-        path_layout.addWidget(self.src_clear_btn, 0, 3)
-        path_layout.addWidget(self.dst_label, 1, 0)
-        path_layout.addWidget(self.dst_input, 1, 1)
-        path_layout.addWidget(self.dst_btn, 1, 2)
-        path_layout.addWidget(self.dst_clear_btn, 1, 3)
-        path_layout.setColumnStretch(1, 1)
+        self.groups_container = QWidget()
+        self.groups_layout = QVBoxLayout(self.groups_container)
+        self.groups_layout.setContentsMargins(0, 0, 0, 0)
+        self.groups_layout.setSpacing(6)
+        self.groups_layout.setAlignment(Qt.AlignTop)
+        self.groups_scroll = QScrollArea()
+        self.groups_scroll.setWidgetResizable(True)
+        self.groups_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.groups_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.groups_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self.groups_scroll.setWidget(self.groups_container)
 
         self.list_view = QTreeView()
         self.list_view.setHeaderHidden(True)
@@ -288,7 +318,7 @@ class MainWindow(QMainWindow):
             self.on_mirror_checked_changed
         )
         self.lang_btn = QPushButton()
-        self.lang_btn.setFixedSize(82, 30)
+        self.lang_btn.setFixedSize(96, 30)
         self.lang_btn.clicked.connect(self.toggle_language)
 
         action_layout = QHBoxLayout()
@@ -309,41 +339,173 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.scan_btn)
         action_layout.addWidget(self.sync_btn)
 
-        language_panel = QWidget()
-        language_panel.setFixedWidth(172)
-        language_layout = QHBoxLayout(language_panel)
-        language_layout.setContentsMargins(0, 0, 0, 0)
-        language_layout.addStretch()
-        language_layout.addWidget(self.lang_btn)
-
-        operation_layout = QHBoxLayout()
-        operation_layout.setSpacing(8)
-        operation_layout.addWidget(self.mirror_checkbox)
-        operation_layout.addStretch()
-        operation_layout.addLayout(action_layout)
-        operation_layout.addWidget(language_panel)
+        operation_layout = QGridLayout()
+        operation_layout.setContentsMargins(0, 0, 8, 0)
+        operation_layout.setHorizontalSpacing(8)
+        operation_layout.addWidget(
+            self.mirror_checkbox, 0, 0, Qt.AlignLeft | Qt.AlignVCenter
+        )
+        operation_layout.addLayout(action_layout, 0, 1, Qt.AlignCenter)
+        operation_layout.addWidget(
+            self.lang_btn, 0, 2, Qt.AlignRight | Qt.AlignVCenter
+        )
+        operation_layout.setColumnMinimumWidth(0, 180)
+        operation_layout.setColumnMinimumWidth(2, 180)
+        operation_layout.setColumnStretch(0, 1)
+        operation_layout.setColumnStretch(2, 1)
 
         self.status_label = QLabel()
         self.status_label.setStyleSheet(
             "QLabel { font-size: 10pt; font-weight: normal; }"
         )
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedSize(260, 10)
+        status_layout = QHBoxLayout()
+        status_layout.setSpacing(10)
+        status_layout.addWidget(self.status_label, 1)
+        status_layout.addWidget(
+            self.progress_bar, 0, Qt.AlignRight | Qt.AlignVCenter
+        )
 
-        layout.addLayout(path_layout)
+        layout.addLayout(top_toolbar)
+        layout.addWidget(self.groups_scroll)
         layout.addLayout(operation_layout)
         layout.addWidget(self.list_view, 1)
-        layout.addWidget(self.status_label)
+        layout.addLayout(status_layout)
         self.setCentralWidget(central_widget)
 
+    def add_directory_group(
+        self, source="", target="", adjust_window=True
+    ):
+        row_widget = QFrame()
+        row_widget.setObjectName("directoryGroup")
+        row_widget.setStyleSheet(
+            "QFrame#directoryGroup {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 6px;"
+            " background-color: palette(base);"
+            "}"
+        )
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(8, 6, 8, 6)
+        row_layout.setSpacing(4)
+
+        group_label = QLabel()
+        group_label.setFixedWidth(52)
+        source_input = QLineEdit(source)
+        source_input.setMinimumWidth(100)
+        source_input.setCursorPosition(0)
+        source_change = QPushButton()
+        source_change.setFixedSize(68, 28)
+        direction_label = QLabel("→")
+        direction_label.setAlignment(Qt.AlignCenter)
+        direction_label.setFixedWidth(24)
+        direction_label.setStyleSheet(
+            "QLabel { font-size: 14pt; font-weight: 600; }"
+        )
+        target_input = QLineEdit(target)
+        target_input.setMinimumWidth(100)
+        target_input.setCursorPosition(0)
+        target_change = QPushButton()
+        target_change.setFixedSize(68, 28)
+        remove_button = QPushButton()
+        remove_button.setFixedSize(96, 28)
+
+        source_input.editingFinished.connect(
+            lambda: self._show_path_start(source_input)
+        )
+        target_input.editingFinished.connect(
+            lambda: self._show_path_start(target_input)
+        )
+
+        row_layout.addWidget(group_label)
+        row_layout.addWidget(source_input, 1)
+        row_layout.addWidget(source_change)
+        row_layout.addWidget(direction_label)
+        row_layout.addWidget(target_input, 1)
+        row_layout.addWidget(target_change)
+        row_layout.addWidget(remove_button)
+
+        row = {
+            "widget": row_widget,
+            "group_label": group_label,
+            "source_input": source_input,
+            "source_change": source_change,
+            "direction_label": direction_label,
+            "target_input": target_input,
+            "target_change": target_change,
+            "remove_button": remove_button,
+        }
+        source_change.clicked.connect(
+            lambda: self.change_directory(source_input, "browse_src")
+        )
+        target_change.clicked.connect(
+            lambda: self.change_directory(target_input, "browse_dst")
+        )
+        remove_button.clicked.connect(
+            lambda: self.remove_directory_group(row)
+        )
+        self.path_rows.append(row)
+        self.groups_layout.addWidget(row_widget)
+        self._update_group_row_texts()
+        self._adjust_group_area(adjust_window)
+
+    def remove_directory_group(self, row):
+        if len(self.path_rows) == 1:
+            row["source_input"].clear()
+            row["target_input"].clear()
+            return
+        self.path_rows.remove(row)
+        row["widget"].setParent(None)
+        row["widget"].deleteLater()
+        self._update_group_row_texts()
+        self._adjust_group_area(True)
+
+    def change_directory(self, editor, title_key):
+        path = QFileDialog.getExistingDirectory(
+            self, self.get_text(title_key), editor.text()
+        )
+        if path:
+            editor.setText(path)
+            self._show_path_start(editor)
+
     @staticmethod
-    def _create_path_editor():
-        editor = QPlainTextEdit()
-        editor.setFixedHeight(50)
-        editor.setLineWrapMode(QPlainTextEdit.NoWrap)
-        editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        editor.setStyleSheet("QPlainTextEdit { padding: 3px 6px; }")
-        editor.setTabChangesFocus(True)
-        return editor
+    def _show_path_start(editor):
+        editor.deselect()
+        editor.setCursorPosition(0)
+
+    def _update_group_row_texts(self):
+        for index, row in enumerate(self.path_rows, start=1):
+            row["group_label"].setText(
+                self.get_text("group_label", index)
+            )
+            row["source_input"].setPlaceholderText(
+                self.get_text("source_placeholder")
+            )
+            row["target_input"].setPlaceholderText(
+                self.get_text("target_placeholder")
+            )
+            row["source_change"].setText(self.get_text("change_btn"))
+            row["target_change"].setText(self.get_text("change_btn"))
+            row["remove_button"].setText(
+                self.get_text("remove_group_btn")
+            )
+
+    def _adjust_group_area(self, resize_window=True):
+        count = max(1, len(self.path_rows))
+        area_height = min(50 * count, 300)
+        self.groups_scroll.setFixedHeight(area_height)
+        if not resize_window:
+            return
+        screen = QApplication.primaryScreen()
+        max_height = (
+            screen.availableGeometry().height() - 80 if screen else 900
+        )
+        desired_height = min(518 + area_height, max_height)
+        self.resize(self.width(), desired_height)
 
     def init_logic(self):
         self.scanner = SyncScanner(str(DB_PATH))
@@ -362,17 +524,24 @@ class MainWindow(QMainWindow):
         self.copy_mgr.copy_finished.connect(self.on_copy_finished)
 
     def load_default_paths(self):
-        self.src_input.setPlainText(
-            "\n".join(self.config["source_directories"])
-        )
-        self.dst_input.setPlainText(
-            "\n".join(self.config["target_directories"])
-        )
+        pairs = self.config["directory_pairs"] or [
+            {"source": "", "target": ""}
+        ]
+        for pair in pairs:
+            self.add_directory_group(
+                pair["source"], pair["target"], adjust_window=False
+            )
+        self._adjust_group_area(True)
 
     def save_config(self):
         data = {
-            "source_directories": self._path_lines(self.src_input),
-            "target_directories": self._path_lines(self.dst_input),
+            "directory_pairs": [
+                {
+                    "source": row["source_input"].text().strip(),
+                    "target": row["target_input"].text().strip(),
+                }
+                for row in self.path_rows
+            ],
             "copy_workers": self.copy_mgr.max_workers,
         }
         temp_path = CONFIG_PATH.with_suffix(".json.tmp")
@@ -390,12 +559,8 @@ class MainWindow(QMainWindow):
 
     def update_ui_texts(self):
         self.setWindowTitle(self.get_text("title"))
-        self.src_label.setText(self.get_text("src_label"))
-        self.src_btn.setText(self.get_text("src_btn"))
-        self.src_clear_btn.setText(self.get_text("clear_btn"))
-        self.dst_label.setText(self.get_text("dst_label"))
-        self.dst_btn.setText(self.get_text("dst_btn"))
-        self.dst_clear_btn.setText(self.get_text("clear_btn"))
+        self.add_group_btn.setText(self.get_text("add_group_btn"))
+        self._update_group_row_texts()
         self.mirror_checkbox.setText(self.get_text("mirror_chk"))
         self.scan_btn.setText(self.get_text("scan_btn"))
         self.sync_btn.setText(self.get_text("sync_btn"))
@@ -409,58 +574,26 @@ class MainWindow(QMainWindow):
         )
         self.update_ui_texts()
 
-    @staticmethod
-    def _path_lines(editor):
-        return [
-            line.strip()
-            for line in editor.toPlainText().splitlines()
-            if line.strip()
-        ]
-
-    @staticmethod
-    def _append_path(editor, path):
-        paths = MainWindow._path_lines(editor)
-        if path not in paths:
-            paths.append(path)
-            editor.setPlainText("\n".join(paths))
-            editor.moveCursor(QTextCursor.End)
-
-    def select_source(self):
-        path = QFileDialog.getExistingDirectory(
-            self, self.get_text("browse_src")
-        )
-        if path:
-            self._append_path(self.src_input, path)
-
-    def select_target(self):
-        path = QFileDialog.getExistingDirectory(
-            self, self.get_text("browse_dst")
-        )
-        if path:
-            self._append_path(self.dst_input, path)
-
     def _validated_pairs(self):
-        sources = self._path_lines(self.src_input)
-        targets = self._path_lines(self.dst_input)
-        if not sources or not targets:
+        if not self.path_rows:
             QMessageBox.warning(
                 self,
                 self.get_text("warn_title"),
                 self.get_text("warn_empty"),
             )
             return None
-        if len(sources) != len(targets):
-            QMessageBox.warning(
-                self,
-                self.get_text("warn_title"),
-                self.get_text("warn_count"),
-            )
-            return None
 
         pairs = []
-        for index, (source, target) in enumerate(
-            zip(sources, targets), start=1
-        ):
+        for index, row in enumerate(self.path_rows, start=1):
+            source = row["source_input"].text().strip()
+            target = row["target_input"].text().strip()
+            if not source or not target:
+                QMessageBox.warning(
+                    self,
+                    self.get_text("warn_title"),
+                    self.get_text("warn_empty"),
+                )
+                return None
             source = os.path.normpath(
                 os.path.abspath(os.path.expandvars(os.path.expanduser(source)))
             )
@@ -491,13 +624,10 @@ class MainWindow(QMainWindow):
                 )
                 return None
             pairs.append((source, target))
-
-        self.src_input.setPlainText(
-            "\n".join(source for source, _ in pairs)
-        )
-        self.dst_input.setPlainText(
-            "\n".join(target for _, target in pairs)
-        )
+            row["source_input"].setText(source)
+            row["target_input"].setText(target)
+            self._show_path_start(row["source_input"])
+            self._show_path_start(row["target_input"])
         return pairs
 
     def start_scan(self):
@@ -515,6 +645,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             self.get_text("scanning", 1, len(pairs))
         )
+        self.progress_bar.setRange(0, 0)
         self.scan_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
 
@@ -550,6 +681,8 @@ class MainWindow(QMainWindow):
     def on_scan_finished(self):
         if self._closing:
             return
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
         self.scan_btn.setEnabled(True)
         if self.scan_error:
             self.status_label.setText(
@@ -641,12 +774,16 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
         self.status_label.setText(self.get_text("start_sync"))
+        self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
+        self.progress_bar.setValue(0)
         self.copy_mgr.start_sync(
             self.diff_data_full,
             mirror_mode=is_mirror,
         )
 
     def on_copy_overall_progress(self, current, total):
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(current)
         self.status_label.setText(
             self.get_text("sync_prog", current, total)
         )
@@ -657,6 +794,7 @@ class MainWindow(QMainWindow):
     def on_copy_finished(self):
         if self._closing:
             return
+        self.progress_bar.setValue(self.progress_bar.maximum())
         self.status_label.setText(self.get_text("sync_done"))
         self.scan_btn.setEnabled(True)
         self.sync_btn.setEnabled(False)
