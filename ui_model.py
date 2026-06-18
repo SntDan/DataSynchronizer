@@ -47,35 +47,54 @@ class TreeNode:
         if self._cached_visible is not None:
             return self._cached_visible
 
-        sync_children = []
-        extra_children = []
+        sync_folders = []
+        sync_files = []
+        extra_folders = []
+        extra_files = []
         for child in self.children:
             if child.is_ellipsis_extra or child.is_ellipsis_sync:
                 continue
-            if child.status in ("EXTRA", "EXTRA_DIR"):
-                extra_children.append(child)
+            is_extra = child.status in ("EXTRA", "EXTRA_DIR")
+            is_folder = bool(child.children) or child.status == "EXTRA_DIR"
+            if is_folder and is_extra:
+                extra_folders.append(child)
+            elif is_folder:
+                sync_folders.append(child)
+            elif is_extra:
+                extra_files.append(child)
             else:
-                sync_children.append(child)
+                sync_files.append(child)
 
         if self.parent is None:
-            self._cached_visible = sync_children + extra_children
+            self._cached_visible = (
+                sync_folders + sync_files + extra_folders + extra_files
+            )
             return self._cached_visible
 
-        visible_sync = sync_children
-        if self.is_truncated_sync and len(sync_children) > 10:
+        visible_sync_files = sync_files
+        if self.is_truncated_sync and len(sync_files) > 10:
             if self.ellipsis_node_sync is None:
                 self.ellipsis_node_sync = TreeNode("... Show All", self)
                 self.ellipsis_node_sync.is_ellipsis_sync = True
-            visible_sync = sync_children[:10] + [self.ellipsis_node_sync]
+            visible_sync_files = sync_files[:10] + [
+                self.ellipsis_node_sync
+            ]
 
-        visible_extra = extra_children
-        if self.is_truncated_extra and len(extra_children) > 10:
+        visible_extra_files = extra_files
+        if self.is_truncated_extra and len(extra_files) > 10:
             if self.ellipsis_node_extra is None:
                 self.ellipsis_node_extra = TreeNode("... Show All", self)
                 self.ellipsis_node_extra.is_ellipsis_extra = True
-            visible_extra = extra_children[:10] + [self.ellipsis_node_extra]
+            visible_extra_files = extra_files[:10] + [
+                self.ellipsis_node_extra
+            ]
 
-        self._cached_visible = visible_sync + visible_extra
+        self._cached_visible = (
+            sync_folders
+            + visible_sync_files
+            + extra_folders
+            + visible_extra_files
+        )
         return self._cached_visible
 
     def add_child(self, path_parts, status, size, rel_path):

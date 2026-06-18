@@ -162,8 +162,7 @@ def load_config():
             data = json.load(file_obj)
         workers = data.get("copy_workers", 4)
         raw_pairs = data.get("directory_pairs")
-        migrated = raw_pairs is None
-        if migrated:
+        if raw_pairs is None:
             sources = data.get("source_directories", [])
             targets = data.get("target_directories", [])
             if not isinstance(sources, list) or not isinstance(targets, list):
@@ -192,11 +191,11 @@ def load_config():
             "directory_pairs": pairs,
             "copy_workers": max(1, int(workers)),
         }
-        if migrated:
-            _write_config(config)
         return config
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except FileNotFoundError:
         _write_config(default_config)
+        return default_config
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return default_config
 
 
@@ -533,30 +532,6 @@ class MainWindow(QMainWindow):
             )
         self._adjust_group_area(True)
 
-    def save_config(self):
-        data = {
-            "directory_pairs": [
-                {
-                    "source": row["source_input"].text().strip(),
-                    "target": row["target_input"].text().strip(),
-                }
-                for row in self.path_rows
-            ],
-            "copy_workers": self.copy_mgr.max_workers,
-        }
-        temp_path = CONFIG_PATH.with_suffix(".json.tmp")
-        try:
-            temp_path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temp_path, CONFIG_PATH)
-        except OSError:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
     def update_ui_texts(self):
         self.setWindowTitle(self.get_text("title"))
         self.add_group_btn.setText(self.get_text("add_group_btn"))
@@ -636,7 +611,6 @@ class MainWindow(QMainWindow):
             return
 
         self.directory_pairs = pairs
-        self.save_config()
         self.diff_data_full.clear()
         self.list_model.clear()
         self.scan_error = None
@@ -806,7 +780,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
-        self.save_config()
         scan_running = (
             hasattr(self, "scan_worker") and self.scan_worker.isRunning()
         )
