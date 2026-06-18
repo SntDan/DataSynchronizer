@@ -9,6 +9,8 @@ from contextlib import closing
 import xxhash
 from PySide6.QtCore import QObject, Signal
 
+from core_scanner import canonical_directory
+
 
 class CopyManager(QObject):
     overall_progress = Signal(int, int)
@@ -254,10 +256,33 @@ class CopyManager(QObject):
 
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("PRAGMA synchronous=NORMAL")
-            upserts = [op[1:] for op in operations if op[0] == "upsert"]
-            deletes = [op[1:] for op in operations if op[0] == "delete"]
+            upserts = [
+                (
+                    op[1],
+                    canonical_directory(op[2]),
+                    canonical_directory(op[3]),
+                    *op[4:],
+                )
+                for op in operations
+                if op[0] == "upsert"
+            ]
+            deletes = [
+                (
+                    op[1],
+                    canonical_directory(op[2]),
+                    canonical_directory(op[3]),
+                )
+                for op in operations
+                if op[0] == "delete"
+            ]
             delete_trees = [
-                op[1:] for op in operations if op[0] == "delete_tree"
+                (
+                    op[1],
+                    canonical_directory(op[2]),
+                    canonical_directory(op[3]),
+                )
+                for op in operations
+                if op[0] == "delete_tree"
             ]
 
             if upserts:

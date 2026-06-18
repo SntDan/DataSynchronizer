@@ -16,6 +16,12 @@ IGNORED_FILENAMES = {
 }
 
 
+def canonical_directory(path):
+    if not path:
+        return ""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
 class SyncScanner(QObject):
     progress_updated = Signal(int, int)
     diff_batch_found = Signal(list)
@@ -58,6 +64,7 @@ class SyncScanner(QObject):
                 conn.execute("DROP TABLE file_snapshot_old")
             else:
                 self._create_snapshot_table(conn)
+            self._canonicalize_snapshot_directories(conn)
 
     @staticmethod
     def _create_snapshot_table(conn):
@@ -73,6 +80,54 @@ class SyncScanner(QObject):
                 PRIMARY KEY (path, src_dir, dst_dir)
             )
             """
+        )
+
+    @staticmethod
+    def _canonicalize_snapshot_directories(conn):
+        groups = conn.execute(
+            "SELECT DISTINCT src_dir, dst_dir FROM file_snapshot"
+        ).fetchall()
+        if all(
+            src_dir == canonical_directory(src_dir)
+            and dst_dir == canonical_directory(dst_dir)
+            for src_dir, dst_dir in groups
+        ):
+            return
+
+        rows = conn.execute(
+            """
+            SELECT path, src_dir, dst_dir, size, mtime, file_hash
+            FROM file_snapshot
+            """
+        ).fetchall()
+        rows.sort(
+            key=lambda row: (
+                row[1] == canonical_directory(row[1])
+                and row[2] == canonical_directory(row[2])
+            )
+        )
+        conn.execute("DELETE FROM file_snapshot")
+        conn.executemany(
+            """
+            INSERT INTO file_snapshot
+                (path, src_dir, dst_dir, size, mtime, file_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path, src_dir, dst_dir) DO UPDATE SET
+                size=excluded.size,
+                mtime=excluded.mtime,
+                file_hash=excluded.file_hash
+            """,
+            [
+                (
+                    path,
+                    canonical_directory(src_dir),
+                    canonical_directory(dst_dir),
+                    size,
+                    mtime,
+                    file_hash,
+                )
+                for path, src_dir, dst_dir, size, mtime, file_hash in rows
+            ],
         )
 
     @staticmethod
@@ -98,6 +153,8 @@ class SyncScanner(QObject):
             cancel_event.is_set if cancel_event is not None else lambda: False
         )
         snapshots = {}
+        snapshot_source = canonical_directory(source_dir)
+        snapshot_target = canonical_directory(target_dir)
         with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.execute(
                 """
@@ -105,7 +162,7 @@ class SyncScanner(QObject):
                 FROM file_snapshot
                 WHERE src_dir=? AND dst_dir=?
                 """,
-                (source_dir, target_dir),
+                (snapshot_source, snapshot_target),
             )
             snapshots = {
                 row[0]: (row[1], row[2], row[3]) for row in cursor
