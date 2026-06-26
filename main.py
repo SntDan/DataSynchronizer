@@ -37,6 +37,7 @@ APP_DIR = (
 )
 CONFIG_PATH = APP_DIR / "config.json"
 DB_PATH = APP_DIR / "sync_snapshot.db"
+DEFAULT_LANGUAGE = "en_US"
 
 
 UI_TEXTS = {
@@ -156,11 +157,17 @@ def load_config():
     default_config = {
         "directory_pairs": [],
         "copy_workers": 4,
+        "default_language": DEFAULT_LANGUAGE,
     }
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
         workers = data.get("copy_workers", 4)
+        default_language = str(
+            data.get("default_language", DEFAULT_LANGUAGE)
+        )
+        if default_language not in UI_TEXTS:
+            default_language = DEFAULT_LANGUAGE
         raw_pairs = data.get("directory_pairs")
         if raw_pairs is None:
             sources = data.get("source_directories", [])
@@ -190,6 +197,7 @@ def load_config():
         config = {
             "directory_pairs": pairs,
             "copy_workers": max(1, int(workers)),
+            "default_language": default_language,
         }
         return config
     except FileNotFoundError:
@@ -246,7 +254,10 @@ class SyncWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.current_lang = "zh_CN"
+        self.config = load_config()
+        self.current_lang = self.config.get(
+            "default_language", DEFAULT_LANGUAGE
+        )
         self.resize(880, 600)
         self.diff_data_full = []
         self.directory_pairs = []
@@ -254,7 +265,6 @@ class MainWindow(QMainWindow):
         self.total_scan_pairs = 1
         self.scan_error = None
         self._closing = False
-        self.config = load_config()
 
         self.init_ui()
         self.init_logic()
