@@ -349,7 +349,7 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.sync_btn)
 
         operation_layout = QGridLayout()
-        operation_layout.setContentsMargins(0, 0, 8, 0)
+        operation_layout.setContentsMargins(3, 0, 8, 0)
         operation_layout.setHorizontalSpacing(8)
         operation_layout.addWidget(
             self.mirror_checkbox, 0, 0, Qt.AlignLeft | Qt.AlignVCenter
