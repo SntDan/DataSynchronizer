@@ -152,8 +152,13 @@ class CopyManager(QObject):
             pass
 
     def _copy_single_file(self, item):
-        status, rel_path, source_path, size, source_dir, target_dir, _ = item
-        target_path = os.path.join(target_dir, rel_path)
+        status, rel_path, source_path, size, source_dir, target_dir, _ = item[:7]
+        target_is_file = len(item) >= 8 and item[7]
+        target_path = (
+            target_dir
+            if target_is_file
+            else os.path.join(target_dir, rel_path)
+        )
         normalized_rel = rel_path.replace("\\", "/")
 
         try:

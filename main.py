@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -46,9 +47,12 @@ UI_TEXTS = {
         "group_label": "第{}组",
         "source_short": "源: ",
         "target_short": "目标: ",
-        "source_placeholder": "源目录",
-        "target_placeholder": "目标目录",
-        "change_btn": "更改",
+        "source_placeholder": "源文件或目录",
+        "target_placeholder": "目标文件或目录",
+        "change_btn": "选择",
+        "choose_folder": "选择文件夹",
+        "choose_file": "选择文件",
+        "choose_target_file": "选择或新建文件",
         "add_group_btn": "添加组",
         "remove_group_btn": "删除组",
         "src_btn": "添加",
@@ -67,10 +71,10 @@ UI_TEXTS = {
         "start_sync": "准备开始同步",
         "sync_prog": "正在同步: {} / {}",
         "sync_done": "同步完成",
-        "sync_done_msg": "所有目录组均已同步完成。",
+        "sync_done_msg": "所有路径组均已同步完成。",
         "sync_confirm_title": "确认同步",
         "sync_confirm_msg": (
-            "即将同步 {} 组目录，请确认：\n\n"
+            "即将同步 {} 组路径，请确认：\n\n"
             "- 新增文件: {}\n"
             "- 替换文件: {}\n"
         ),
@@ -82,15 +86,19 @@ UI_TEXTS = {
             "\n注意：目标中 {} 个多余项目不会被删除。"
         ),
         "warn_title": "警告",
-        "warn_empty": "请至少设置一组源目录和目标目录。",
+        "warn_empty": "请至少设置一组源路径和目标路径。",
         "warn_count": "源目录和目标目录数量必须一致，并按行号一一对应。",
-        "warn_source": "源目录不存在或不是文件夹：\n{}",
+        "warn_source": "源文件或目录不存在：\n{}",
         "warn_target": "无法创建目标目录：\n{}",
+        "warn_dir_to_file": "第 {} 组不能把源目录同步到单个目标文件。",
         "warn_same": "第 {} 组的源目录和目标目录不能相同。",
+        "warn_same_file": "第 {} 组的目标不能指向源文件本身。",
         "scan_error": "扫描失败：\n{}",
         "done_title": "成功",
         "browse_src": "选择源目录",
+        "browse_src_file": "选择源文件",
         "browse_dst": "选择目标目录",
+        "browse_dst_file": "选择或新建目标文件",
         "busy_close": "扫描或同步仍在进行，请等待任务完成后再关闭。",
     },
     "en_US": {
@@ -98,9 +106,12 @@ UI_TEXTS = {
         "group_label": "Group {}",
         "source_short": "Src:",
         "target_short": "Dst:",
-        "source_placeholder": "Source directory",
-        "target_placeholder": "Target directory",
-        "change_btn": "Edit",
+        "source_placeholder": "Source file or directory",
+        "target_placeholder": "Target file or directory",
+        "change_btn": "Choose",
+        "choose_folder": "Select Folder",
+        "choose_file": "Select File",
+        "choose_target_file": "Select or Create File",
         "add_group_btn": "Add Grp",
         "remove_group_btn": "Del Grp",
         "src_btn": "Add",
@@ -119,10 +130,10 @@ UI_TEXTS = {
         "start_sync": "Preparing to synchronize",
         "sync_prog": "Synchronizing: {} / {}",
         "sync_done": "Synchronization complete",
-        "sync_done_msg": "All directory pairs have been synchronized.",
+        "sync_done_msg": "All path pairs have been synchronized.",
         "sync_confirm_title": "Confirm Synchronization",
         "sync_confirm_msg": (
-            "Synchronize {} directory pairs?\n\n"
+            "Synchronize {} path pairs?\n\n"
             "- New files: {}\n"
             "- Modified files: {}\n"
         ),
@@ -134,17 +145,25 @@ UI_TEXTS = {
             "\nNote: {} extra target items will not be deleted."
         ),
         "warn_title": "Warning",
-        "warn_empty": "Please specify at least one source and target pair.",
+        "warn_empty": "Please specify at least one source and target path pair.",
         "warn_count": (
             "Source and target counts must match; lines are paired by number."
         ),
-        "warn_source": "Source directory does not exist:\n{}",
+        "warn_source": "Source file or directory does not exist:\n{}",
         "warn_target": "Could not create target directory:\n{}",
+        "warn_dir_to_file": (
+            "Pair {} cannot synchronize a source directory to one file."
+        ),
         "warn_same": "Source and target in pair {} cannot be the same.",
+        "warn_same_file": (
+            "The target in pair {} cannot resolve to the source file itself."
+        ),
         "scan_error": "Scan failed:\n{}",
         "done_title": "Success",
         "browse_src": "Select Source Directory",
+        "browse_src_file": "Select Source File",
         "browse_dst": "Select Target Directory",
+        "browse_dst_file": "Select or Create Target File",
         "busy_close": (
             "A scan or synchronization is still running. "
             "Please wait for it to finish."
@@ -191,6 +210,11 @@ def load_config():
                 {
                     "source": str(pair.get("source", "")),
                     "target": str(pair.get("target", "")),
+                    "target_type": (
+                        str(pair.get("target_type", ""))
+                        if pair.get("target_type") in ("file", "directory")
+                        else ""
+                    ),
                 }
             )
 
@@ -234,9 +258,8 @@ class SyncWorker(QThread):
     def run(self):
         total = len(self.directory_pairs)
         try:
-            for index, (source_dir, target_dir) in enumerate(
-                self.directory_pairs
-            ):
+            for index, pair in enumerate(self.directory_pairs):
+                source_dir, target_dir, target_is_file = pair
                 if self.cancel_event.is_set():
                     return
                 self.pair_started.emit(index + 1, total)
@@ -246,6 +269,7 @@ class SyncWorker(QThread):
                     self.deep_hash,
                     pair_index=index,
                     cancel_event=self.cancel_event,
+                    target_is_file=target_is_file,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -387,7 +411,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
     def add_directory_group(
-        self, source="", target="", adjust_window=True
+        self,
+        source="",
+        target="",
+        adjust_window=True,
+        target_type="",
     ):
         row_widget = QFrame()
         row_widget.setObjectName("directoryGroup")
@@ -409,6 +437,10 @@ class MainWindow(QMainWindow):
         source_input.setCursorPosition(0)
         source_change = QPushButton()
         source_change.setFixedSize(68, 28)
+        source_menu = QMenu(source_change)
+        source_folder_action = source_menu.addAction("")
+        source_file_action = source_menu.addAction("")
+        source_change.setMenu(source_menu)
         direction_label = QLabel("→")
         direction_label.setAlignment(Qt.AlignCenter)
         direction_label.setFixedWidth(24)
@@ -418,8 +450,18 @@ class MainWindow(QMainWindow):
         target_input = QLineEdit(target)
         target_input.setMinimumWidth(100)
         target_input.setCursorPosition(0)
+        target_input.setProperty(
+            "path_type",
+            target_type
+            if target_type in ("file", "directory")
+            else ("file" if os.path.isfile(target) else "directory"),
+        )
         target_change = QPushButton()
         target_change.setFixedSize(68, 28)
+        target_menu = QMenu(target_change)
+        target_folder_action = target_menu.addAction("")
+        target_file_action = target_menu.addAction("")
+        target_change.setMenu(target_menu)
         remove_button = QPushButton()
         remove_button.setFixedSize(96, 28)
 
@@ -443,16 +485,33 @@ class MainWindow(QMainWindow):
             "group_label": group_label,
             "source_input": source_input,
             "source_change": source_change,
+            "source_folder_action": source_folder_action,
+            "source_file_action": source_file_action,
             "direction_label": direction_label,
             "target_input": target_input,
             "target_change": target_change,
+            "target_folder_action": target_folder_action,
+            "target_file_action": target_file_action,
             "remove_button": remove_button,
         }
-        source_change.clicked.connect(
+        source_folder_action.triggered.connect(
             lambda: self.change_directory(source_input, "browse_src")
         )
-        target_change.clicked.connect(
-            lambda: self.change_directory(target_input, "browse_dst")
+        source_file_action.triggered.connect(
+            lambda: self.change_file(source_input, "browse_src_file")
+        )
+        target_folder_action.triggered.connect(
+            lambda: self.change_directory(
+                target_input, "browse_dst", path_type="directory"
+            )
+        )
+        target_file_action.triggered.connect(
+            lambda: self.change_file(
+                target_input,
+                "browse_dst_file",
+                save=True,
+                path_type="file",
+            )
         )
         remove_button.clicked.connect(
             lambda: self.remove_directory_group(row)
@@ -466,6 +525,7 @@ class MainWindow(QMainWindow):
         if len(self.path_rows) == 1:
             row["source_input"].clear()
             row["target_input"].clear()
+            row["target_input"].setProperty("path_type", "directory")
             return
         self.path_rows.remove(row)
         row["widget"].setParent(None)
@@ -473,12 +533,35 @@ class MainWindow(QMainWindow):
         self._update_group_row_texts()
         self._adjust_group_area(True)
 
-    def change_directory(self, editor, title_key):
+    def change_directory(self, editor, title_key, path_type=None):
         path = QFileDialog.getExistingDirectory(
             self, self.get_text(title_key), editor.text()
         )
         if path:
             editor.setText(path)
+            if path_type:
+                editor.setProperty("path_type", path_type)
+            self._show_path_start(editor)
+
+    def change_file(
+        self, editor, title_key, save=False, path_type=None
+    ):
+        current_path = editor.text().strip()
+        start_path = (
+            current_path
+            if os.path.isdir(current_path)
+            else os.path.dirname(current_path)
+        )
+        dialog_method = (
+            QFileDialog.getSaveFileName
+            if save
+            else QFileDialog.getOpenFileName
+        )
+        path, _ = dialog_method(self, self.get_text(title_key), start_path)
+        if path:
+            editor.setText(path)
+            if path_type:
+                editor.setProperty("path_type", path_type)
             self._show_path_start(editor)
 
     @staticmethod
@@ -498,7 +581,19 @@ class MainWindow(QMainWindow):
                 self.get_text("target_placeholder")
             )
             row["source_change"].setText(self.get_text("change_btn"))
+            row["source_folder_action"].setText(
+                self.get_text("choose_folder")
+            )
+            row["source_file_action"].setText(
+                self.get_text("choose_file")
+            )
             row["target_change"].setText(self.get_text("change_btn"))
+            row["target_folder_action"].setText(
+                self.get_text("choose_folder")
+            )
+            row["target_file_action"].setText(
+                self.get_text("choose_target_file")
+            )
             row["remove_button"].setText(
                 self.get_text("remove_group_btn")
             )
@@ -538,7 +633,10 @@ class MainWindow(QMainWindow):
         ]
         for pair in pairs:
             self.add_directory_group(
-                pair["source"], pair["target"], adjust_window=False
+                pair["source"],
+                pair["target"],
+                adjust_window=False,
+                target_type=pair.get("target_type", ""),
             )
         self._adjust_group_area(True)
 
@@ -585,32 +683,68 @@ class MainWindow(QMainWindow):
             target = os.path.normpath(
                 os.path.abspath(os.path.expandvars(os.path.expanduser(target)))
             )
-            if not os.path.isdir(source):
+            if not os.path.isdir(source) and not os.path.isfile(source):
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
                     self.get_text("warn_source", source),
                 )
                 return None
+            target_is_file = row["target_input"].property("path_type") == "file"
+            if os.path.isfile(target):
+                target_is_file = True
+            elif os.path.isdir(target):
+                target_is_file = False
+
+            if os.path.isdir(source) and target_is_file:
+                QMessageBox.warning(
+                    self,
+                    self.get_text("warn_title"),
+                    self.get_text("warn_dir_to_file", index),
+                )
+                return None
+
+            target_parent = os.path.dirname(target) if target_is_file else target
             try:
-                os.makedirs(target, exist_ok=True)
+                os.makedirs(target_parent, exist_ok=True)
             except OSError:
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
-                    self.get_text("warn_target", target),
+                    self.get_text("warn_target", target_parent),
                 )
                 return None
-            if os.path.normcase(source) == os.path.normcase(target):
+
+            if os.path.isdir(source):
+                same_destination = (
+                    os.path.normcase(source) == os.path.normcase(target)
+                )
+            else:
+                target_file = (
+                    target
+                    if target_is_file
+                    else os.path.join(target, os.path.basename(source))
+                )
+                same_destination = (
+                    os.path.normcase(source) == os.path.normcase(target_file)
+                )
+            if same_destination:
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
-                    self.get_text("warn_same", index),
+                    self.get_text(
+                        "warn_same_file" if os.path.isfile(source) else "warn_same",
+                        index,
+                    ),
                 )
                 return None
-            pairs.append((source, target))
+
+            pairs.append((source, target, target_is_file))
             row["source_input"].setText(source)
             row["target_input"].setText(target)
+            row["target_input"].setProperty(
+                "path_type", "file" if target_is_file else "directory"
+            )
             self._show_path_start(row["source_input"])
             self._show_path_start(row["target_input"])
         return pairs

@@ -148,6 +148,7 @@ class SyncScanner(QObject):
         use_deep_hash=False,
         pair_index=0,
         cancel_event=None,
+        target_is_file=False,
     ):
         is_cancelled = (
             cancel_event.is_set if cancel_event is not None else lambda: False
@@ -184,13 +185,61 @@ class SyncScanner(QObject):
                     source_dir,
                     target_dir,
                     pair_index,
+                    target_is_file,
                 )
             )
             if len(differences) >= 1000:
                 self.diff_batch_found.emit(list(differences))
                 differences.clear()
 
-        if os.path.isdir(source_dir):
+        def compare_source_file(source_path, rel_path, source_stat):
+            nonlocal scanned_count
+            size = source_stat.st_size
+            mtime = source_stat.st_mtime
+            source_files.add(rel_path)
+            target_path = (
+                target_dir
+                if target_is_file
+                else os.path.join(target_dir, rel_path)
+            )
+            snapshot = snapshots.get(rel_path.replace("\\", "/"))
+            status = None
+
+            if snapshot is None:
+                try:
+                    target_stat = os.stat(target_path)
+                    if (
+                        target_stat.st_size != size
+                        or target_stat.st_mtime < mtime
+                    ):
+                        status = "MODIFIED"
+                except OSError:
+                    status = "NEW"
+            else:
+                snap_size, snap_mtime, snap_hash = snapshot
+                if snap_size != size or snap_mtime != mtime:
+                    if (
+                        not use_deep_hash
+                        or self.get_file_hash(source_path) != snap_hash
+                    ):
+                        status = "MODIFIED"
+                else:
+                    try:
+                        if os.stat(target_path).st_size != size:
+                            status = "MODIFIED"
+                    except OSError:
+                        status = "NEW"
+
+            if status:
+                add_difference(status, rel_path, source_path, size)
+
+            scanned_count += 1
+            if scanned_count % 500 == 0:
+                self.progress_updated.emit(scanned_count, 0)
+
+        source_is_directory = os.path.isdir(source_dir)
+
+        if source_is_directory:
             stack = [(source_dir, "")]
             while stack:
                 if is_cancelled():
@@ -227,53 +276,29 @@ class SyncScanner(QObject):
                             except OSError:
                                 continue
 
-                            size = source_stat.st_size
-                            mtime = source_stat.st_mtime
-                            source_files.add(rel_path)
-                            target_path = os.path.join(target_dir, rel_path)
-                            snapshot = snapshots.get(
-                                rel_path.replace("\\", "/")
+                            compare_source_file(
+                                entry.path, rel_path, source_stat
                             )
-                            status = None
-
-                            if snapshot is None:
-                                try:
-                                    target_stat = os.stat(target_path)
-                                    if (
-                                        target_stat.st_size != size
-                                        or target_stat.st_mtime < mtime
-                                    ):
-                                        status = "MODIFIED"
-                                except OSError:
-                                    status = "NEW"
-                            else:
-                                snap_size, snap_mtime, snap_hash = snapshot
-                                if snap_size != size or snap_mtime != mtime:
-                                    if (
-                                        not use_deep_hash
-                                        or self.get_file_hash(entry.path)
-                                        != snap_hash
-                                    ):
-                                        status = "MODIFIED"
-                                else:
-                                    try:
-                                        if os.stat(target_path).st_size != size:
-                                            status = "MODIFIED"
-                                    except OSError:
-                                        status = "NEW"
-
-                            if status:
-                                add_difference(
-                                    status, rel_path, entry.path, size
-                                )
-
-                            scanned_count += 1
-                            if scanned_count % 500 == 0:
-                                self.progress_updated.emit(scanned_count, 0)
                 except OSError:
                     continue
 
-        if os.path.isdir(target_dir):
+        elif os.path.isfile(source_dir):
+            try:
+                compare_source_file(
+                    source_dir,
+                    os.path.basename(source_dir),
+                    os.stat(source_dir),
+                )
+            except OSError:
+                pass
+
+        # A single-file pair only owns its same-named target file. It must not
+        # treat unrelated contents of the target directory as mirror extras.
+        if (
+            source_is_directory
+            and not target_is_file
+            and os.path.isdir(target_dir)
+        ):
             stack = [(target_dir, "")]
             while stack:
                 if is_cancelled():

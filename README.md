@@ -7,11 +7,12 @@
 <a name="english"></a>
 ## Data Synchronizer
 
-A small PySide6 desktop tool for one-way file synchronization. It compares source and target folders, shows the differences, then copies new or modified files after confirmation.
+A small PySide6 desktop tool for one-way file synchronization. It compares source and target paths, shows the differences, then copies new or modified files after confirmation.
 
 ## Features
 
 - Compare multiple source/target directory pairs in one run
+- Select a folder or an individual file on both sides
 - Show new, modified, and extra target files in a tree view
 - Copy new and modified files from source to target
 - Optional mirror mode to remove extra target files and folders
@@ -56,6 +57,11 @@ UI changes do not write back to `config.json`.
     {
       "source": "D:/Documents",
       "target": "E:/Backup/Documents"
+    },
+    {
+      "source": "D:/Settings/app.ini",
+      "target": "E:/Backup/app-backup.ini",
+      "target_type": "file"
     }
   ],
   "copy_workers": 4,
@@ -64,6 +70,7 @@ UI changes do not write back to `config.json`.
 ```
 
 - `directory_pairs`: independent one-way sync groups
+- `target_type`: optional `file` or `directory`; useful when a configured target file does not exist yet
 - `copy_workers`: maximum concurrent copy workers
 - `default_language`: `en_US` or `zh_CN`
 
@@ -72,6 +79,8 @@ UI changes do not write back to `config.json`.
 Folders that contain differences are always shown. If one folder has many changed files, only the first 10 files are shown at first; click **... Show All** to expand them.
 
 Mirror mode deletes `[EXTRA]` and `[EXTRA_DIR]` items from the target. Keep it off if the target contains files you want to preserve.
+
+An individual source file can target either a folder or a specific file. When targeting a folder, the original filename is used; when targeting a file, that exact path and filename are used. Mirror mode never removes unrelated files from the target folder. A source folder cannot target one individual file.
 
 ## Project Structure
 
@@ -100,11 +109,12 @@ pyinstaller --noconfirm --onefile --windowed --name DataSynchronizer main.py
 <a name="中文"></a>
 ## Data Synchronizer
 
-一个基于 PySide6 的轻量文件同步工具。它会比较源目录和目标目录，先显示差异，确认后再把新增或修改的文件复制到目标目录。
+一个基于 PySide6 的轻量文件同步工具。它会比较源路径和目标路径，先显示差异，确认后再复制新增或修改的文件。
 
 ## 功能
 
 - 一次处理多组源目录和目标目录
+- 源路径和目标路径均可选择文件夹或单个文件
 - 用树状列表显示新增、修改和目标端多余文件
 - 单向同步：源目录复制到目标目录
 - 可选镜像模式：删除目标端多余文件和文件夹
@@ -149,6 +159,11 @@ python main.py
     {
       "source": "D:/文档",
       "target": "E:/备份/文档"
+    },
+    {
+      "source": "D:/设置/app.ini",
+      "target": "E:/备份/app-backup.ini",
+      "target_type": "file"
     }
   ],
   "copy_workers": 4,
@@ -157,6 +172,7 @@ python main.py
 ```
 
 - `directory_pairs`：独立的单向同步组
+- `target_type`：可选值为 `file` 或 `directory`；目标文件尚不存在时可用它明确类型
 - `copy_workers`：最大并发复制线程数
 - `default_language`：`en_US` 或 `zh_CN`
 
@@ -165,6 +181,8 @@ python main.py
 所有包含差异的文件夹都会显示。单个文件夹内文件过多时，默认只显示前 10 个文件，点击 **... Show All** 可展开其余内容。
 
 镜像模式会删除目标目录中的 `[EXTRA]` 和 `[EXTRA_DIR]` 项。如果目标目录里有需要保留的文件，请不要开启镜像模式。
+
+单个源文件既可同步到目标目录，也可同步到指定的目标文件。目标为目录时保留原文件名；目标为文件时使用指定的完整路径和文件名。镜像模式不会删除目标目录里的无关文件。源目录不能同步到单个目标文件。
 
 ## 项目结构
 
