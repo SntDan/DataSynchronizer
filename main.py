@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from itertools import zip_longest
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QRect, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,8 +19,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QProgressBar,
+    QProxyStyle,
     QPushButton,
     QScrollArea,
+    QStyle,
+    QStyleOption,
+    QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -39,6 +43,10 @@ APP_DIR = (
 CONFIG_PATH = APP_DIR / "config.json"
 DB_PATH = APP_DIR / "sync_snapshot.db"
 DEFAULT_LANGUAGE = "en_US"
+PATH_MENU_STYLE = (
+    "QMenu { padding: 3px; }"
+    "QMenu::item { padding: 6px 16px 6px 8px; }"
+)
 
 
 UI_TEXTS = {
@@ -241,6 +249,29 @@ def _write_config(data):
         pass
 
 
+class PathButtonStyle(QProxyStyle):
+    def pixelMetric(self, metric, option=None, widget=None):
+        if (
+            metric == QStyle.PM_MenuButtonIndicator
+            and isinstance(widget, QToolButton)
+        ):
+            return 22
+        return super().pixelMetric(metric, option, widget)
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if (
+            element == QStyle.PE_IndicatorArrowDown
+            and isinstance(widget, QToolButton)
+        ):
+            adjusted = QStyleOption(option)
+            center = option.rect.center()
+            center.setY(center.y() - 1)
+            adjusted.rect = QRect(0, 0, 12, 8)
+            adjusted.rect.moveCenter(center)
+            option = adjusted
+        super().drawPrimitive(element, option, painter, widget)
+
+
 class SyncWorker(QThread):
     pair_started = Signal(int, int)
     failed = Signal(str)
@@ -303,13 +334,14 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         central_widget.setStyleSheet(
             "QLabel, QCheckBox, QLineEdit { font-size: 10pt; }"
-            "QPushButton { font-size: 10pt; }"
+            "QPushButton, QToolButton { font-size: 10pt; }"
         )
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         self.path_rows = []
+        self.path_button_style = PathButtonStyle()
         self.add_group_btn = QPushButton()
         self.add_group_btn.setFixedSize(96, 30)
         self.add_group_btn.clicked.connect(
@@ -434,10 +466,14 @@ class MainWindow(QMainWindow):
         group_label.setFixedWidth(52)
         source_input = QLineEdit(source)
         source_input.setMinimumWidth(100)
-        source_input.setCursorPosition(0)
-        source_change = QPushButton()
-        source_change.setFixedSize(68, 28)
+        source_input.setCursorPosition(len(source))
+        source_change = QToolButton()
+        source_change.setStyle(self.path_button_style)
+        source_change.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        source_change.setPopupMode(QToolButton.MenuButtonPopup)
+        source_change.setFixedSize(91, 28)
         source_menu = QMenu(source_change)
+        source_menu.setStyleSheet(PATH_MENU_STYLE)
         source_folder_action = source_menu.addAction("")
         source_file_action = source_menu.addAction("")
         source_change.setMenu(source_menu)
@@ -449,27 +485,33 @@ class MainWindow(QMainWindow):
         )
         target_input = QLineEdit(target)
         target_input.setMinimumWidth(100)
-        target_input.setCursorPosition(0)
+        target_input.setCursorPosition(len(target))
         target_input.setProperty(
             "path_type",
             target_type
             if target_type in ("file", "directory")
             else ("file" if os.path.isfile(target) else "directory"),
         )
-        target_change = QPushButton()
-        target_change.setFixedSize(68, 28)
+        target_change = QToolButton()
+        target_change.setStyle(self.path_button_style)
+        target_change.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        target_change.setPopupMode(QToolButton.MenuButtonPopup)
+        target_change.setFixedSize(91, 28)
         target_menu = QMenu(target_change)
+        target_menu.setStyleSheet(PATH_MENU_STYLE)
         target_folder_action = target_menu.addAction("")
         target_file_action = target_menu.addAction("")
         target_change.setMenu(target_menu)
+        source_change.clicked.connect(source_change.showMenu)
+        target_change.clicked.connect(target_change.showMenu)
         remove_button = QPushButton()
         remove_button.setFixedSize(96, 28)
 
         source_input.editingFinished.connect(
-            lambda: self._show_path_start(source_input)
+            lambda: self._show_path_end(source_input)
         )
         target_input.editingFinished.connect(
-            lambda: self._show_path_start(target_input)
+            lambda: self._show_path_end(target_input)
         )
 
         row_layout.addWidget(group_label)
@@ -541,7 +583,7 @@ class MainWindow(QMainWindow):
             editor.setText(path)
             if path_type:
                 editor.setProperty("path_type", path_type)
-            self._show_path_start(editor)
+            self._show_path_end(editor)
 
     def change_file(
         self, editor, title_key, save=False, path_type=None
@@ -562,12 +604,12 @@ class MainWindow(QMainWindow):
             editor.setText(path)
             if path_type:
                 editor.setProperty("path_type", path_type)
-            self._show_path_start(editor)
+            self._show_path_end(editor)
 
     @staticmethod
-    def _show_path_start(editor):
+    def _show_path_end(editor):
         editor.deselect()
-        editor.setCursorPosition(0)
+        editor.setCursorPosition(len(editor.text()))
 
     def _update_group_row_texts(self):
         for index, row in enumerate(self.path_rows, start=1):
@@ -745,8 +787,8 @@ class MainWindow(QMainWindow):
             row["target_input"].setProperty(
                 "path_type", "file" if target_is_file else "directory"
             )
-            self._show_path_start(row["source_input"])
-            self._show_path_start(row["target_input"])
+            self._show_path_end(row["source_input"])
+            self._show_path_end(row["target_input"])
         return pairs
 
     def start_scan(self):
