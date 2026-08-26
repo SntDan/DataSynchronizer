@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from itertools import zip_longest
 
-from PySide6.QtCore import QRect, QThread, Qt, Signal
+from PySide6.QtCore import QRect, QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -71,9 +71,12 @@ UI_TEXTS = {
         "mirror_chk": "删除多余文件",
         "scan_btn": "1. 扫描差异",
         "sync_btn": "2. 开始同步",
+        "stop_btn": "停止",
         "lang_btn": "English",
         "ready": "就绪",
         "scanning": "正在扫描第 {} / {} 组",
+        "stopping": "正在停止扫描……",
+        "scan_stopped": "扫描已停止",
         "scan_done": "扫描完成  新增: {}，修改: {}，多余: {}",
         "scan_prog": "正在扫描第 {} / {} 组，已检查 {} 个文件",
         "start_sync": "准备开始同步",
@@ -130,9 +133,12 @@ UI_TEXTS = {
         "mirror_chk": "Remove extras",
         "scan_btn": "1. Scan",
         "sync_btn": "2. Sync",
+        "stop_btn": "Stop",
         "lang_btn": "中文",
         "ready": "Ready",
         "scanning": "Scanning pair {} / {}",
+        "stopping": "Stopping scan…",
+        "scan_stopped": "Scan stopped",
         "scan_done": "Scan complete  New: {}, Modified: {}, Extra: {}",
         "scan_prog": "Scanning pair {} / {}, checked {} files",
         "start_sync": "Preparing to synchronize",
@@ -282,6 +288,7 @@ class SyncWorker(QThread):
         self.directory_pairs = directory_pairs
         self.deep_hash = deep_hash
         self.cancel_event = threading.Event()
+        self.was_cancelled = False
 
     def cancel(self):
         self.cancel_event.set()
@@ -292,6 +299,7 @@ class SyncWorker(QThread):
             for index, pair in enumerate(self.directory_pairs):
                 source_dir, target_dir, target_is_file = pair
                 if self.cancel_event.is_set():
+                    self.was_cancelled = True
                     return
                 self.pair_started.emit(index + 1, total)
                 self.scanner.scan_and_compare(
@@ -302,6 +310,9 @@ class SyncWorker(QThread):
                     cancel_event=self.cancel_event,
                     target_is_file=target_is_file,
                 )
+                if self.cancel_event.is_set():
+                    self.was_cancelled = True
+                    return
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -319,6 +330,8 @@ class MainWindow(QMainWindow):
         self.current_scan_pair = 1
         self.total_scan_pairs = 1
         self.scan_error = None
+        self.status_key = "ready"
+        self.status_args = ()
         self._closing = False
 
         self.init_ui()
@@ -401,18 +414,27 @@ class MainWindow(QMainWindow):
         self.sync_btn.setFixedSize(200, 40)
         self.sync_btn.clicked.connect(self.start_sync)
         self.sync_btn.setEnabled(False)
+        self.stop_btn = QPushButton()
+        self.stop_btn.setFixedSize(69, 30)
+        self.stop_btn.clicked.connect(self.stop_scan)
+        self.stop_btn.setVisible(False)
         action_layout.addWidget(self.scan_btn)
         action_layout.addWidget(self.sync_btn)
 
+        right_action_layout = QHBoxLayout()
+        right_action_layout.setSpacing(26)
+        right_action_layout.addWidget(self.stop_btn)
+        right_action_layout.addWidget(self.lang_btn)
+
         operation_layout = QGridLayout()
-        operation_layout.setContentsMargins(3, 0, 8, 0)
+        operation_layout.setContentsMargins(3, 0, 9, 0)
         operation_layout.setHorizontalSpacing(8)
         operation_layout.addWidget(
             self.mirror_checkbox, 0, 0, Qt.AlignLeft | Qt.AlignVCenter
         )
         operation_layout.addLayout(action_layout, 0, 1, Qt.AlignCenter)
-        operation_layout.addWidget(
-            self.lang_btn, 0, 2, Qt.AlignRight | Qt.AlignVCenter
+        operation_layout.addLayout(
+            right_action_layout, 0, 2, Qt.AlignRight | Qt.AlignVCenter
         )
         operation_layout.setColumnMinimumWidth(0, 180)
         operation_layout.setColumnMinimumWidth(2, 180)
@@ -689,9 +711,19 @@ class MainWindow(QMainWindow):
         self.mirror_checkbox.setText(self.get_text("mirror_chk"))
         self.scan_btn.setText(self.get_text("scan_btn"))
         self.sync_btn.setText(self.get_text("sync_btn"))
+        self.stop_btn.setText(self.get_text("stop_btn"))
         self.lang_btn.setText(self.get_text("lang_btn"))
-        if not self.diff_data_full:
-            self.status_label.setText(self.get_text("ready"))
+        self._render_status()
+
+    def set_status(self, key, *args):
+        self.status_key = key
+        self.status_args = args
+        self._render_status()
+
+    def _render_status(self):
+        self.status_label.setText(
+            self.get_text(self.status_key, *self.status_args)
+        )
 
     def toggle_language(self):
         self.current_lang = (
@@ -802,12 +834,12 @@ class MainWindow(QMainWindow):
         self.scan_error = None
         self.current_scan_pair = 1
         self.total_scan_pairs = len(pairs)
-        self.status_label.setText(
-            self.get_text("scanning", 1, len(pairs))
-        )
+        self.set_status("scanning", 1, len(pairs))
         self.progress_bar.setRange(0, 0)
         self.scan_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.stop_btn.setVisible(True)
 
         self.scan_worker = SyncWorker(self.scanner, pairs, deep_hash=False)
         self.scan_worker.pair_started.connect(self.on_pair_started)
@@ -815,24 +847,32 @@ class MainWindow(QMainWindow):
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.start()
 
+    def stop_scan(self):
+        worker = getattr(self, "scan_worker", None)
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self.stop_btn.setEnabled(False)
+        self.set_status("stopping")
+
     def on_pair_started(self, current, total):
+        if self.scan_worker.cancel_event.is_set():
+            return
         self.current_scan_pair = current
         self.total_scan_pairs = total
-        self.status_label.setText(
-            self.get_text("scanning", current, total)
-        )
+        self.set_status("scanning", current, total)
 
     def on_diff_batch(self, differences):
         self.diff_data_full.extend(differences)
 
     def on_scan_progress(self, count, total):
-        self.status_label.setText(
-            self.get_text(
-                "scan_prog",
-                self.current_scan_pair,
-                self.total_scan_pairs,
-                count,
-            )
+        if self.scan_worker.cancel_event.is_set():
+            return
+        self.set_status(
+            "scan_prog",
+            self.current_scan_pair,
+            self.total_scan_pairs,
+            count,
         )
 
     def on_scan_failed(self, message):
@@ -842,12 +882,19 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
         self.scan_btn.setEnabled(True)
+        self.stop_btn.setVisible(False)
+        if self.scan_worker.was_cancelled:
+            self.diff_data_full.clear()
+            self.list_model.clear()
+            self.progress_bar.setValue(0)
+            self.sync_btn.setEnabled(False)
+            self.set_status("scan_stopped")
+            return
+
+        self.progress_bar.setValue(100)
         if self.scan_error:
-            self.status_label.setText(
-                self.get_text("scan_error", self.scan_error)
-            )
+            self.set_status("scan_error", self.scan_error)
             QMessageBox.warning(
                 self,
                 self.get_text("warn_title"),
@@ -859,13 +906,11 @@ class MainWindow(QMainWindow):
             self.list_model.add_batch(self.diff_data_full)
 
         counts = self._difference_counts()
-        self.status_label.setText(
-            self.get_text(
-                "scan_done",
-                counts["NEW"],
-                counts["MODIFIED"],
-                counts["EXTRA"] + counts["EXTRA_DIR"],
-            )
+        self.set_status(
+            "scan_done",
+            counts["NEW"],
+            counts["MODIFIED"],
+            counts["EXTRA"] + counts["EXTRA_DIR"],
         )
         self.sync_btn.setEnabled(bool(self.diff_data_full))
         self.expand_smartly()
@@ -933,7 +978,7 @@ class MainWindow(QMainWindow):
 
         self.scan_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
-        self.status_label.setText(self.get_text("start_sync"))
+        self.set_status("start_sync")
         self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
         self.progress_bar.setValue(0)
         self.copy_mgr.start_sync(
@@ -944,9 +989,7 @@ class MainWindow(QMainWindow):
     def on_copy_overall_progress(self, current, total):
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(current)
-        self.status_label.setText(
-            self.get_text("sync_prog", current, total)
-        )
+        self.set_status("sync_prog", current, total)
 
     def on_copy_file_progress(self, file_path, percent):
         pass
@@ -955,7 +998,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self.progress_bar.setValue(self.progress_bar.maximum())
-        self.status_label.setText(self.get_text("sync_done"))
+        self.set_status("sync_done")
         self.scan_btn.setEnabled(True)
         self.sync_btn.setEnabled(False)
         QMessageBox.information(
@@ -971,11 +1014,24 @@ class MainWindow(QMainWindow):
         )
         if scan_running:
             self.scan_worker.cancel()
-            self.scan_worker.wait(3000)
         if self.copy_mgr.is_syncing:
             self.copy_mgr.cancel()
-            self.copy_mgr.wait_for_finished(3.0)
+
+        if scan_running or self.copy_mgr.is_syncing:
+            event.ignore()
+            self.hide()
+            QTimer.singleShot(50, self._close_when_workers_finish)
+            return
+
         event.accept()
+
+    def _close_when_workers_finish(self):
+        scan_running = (
+            hasattr(self, "scan_worker") and self.scan_worker.isRunning()
+        )
+        if scan_running or self.copy_mgr.is_syncing:
+            QTimer.singleShot(50, self._close_when_workers_finish)
+            return
         QApplication.quit()
 
 
@@ -984,4 +1040,4 @@ if __name__ == "__main__":
     window = MainWindow()
     window.show()
     exit_code = app.exec()
-    os._exit(exit_code)
+    sys.exit(exit_code)
