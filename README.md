@@ -26,12 +26,13 @@ A small PySide6 desktop tool for one-way file synchronization. It compares sourc
 | Dependency | Version |
 |---|---|
 | Python | >= 3.10 |
-| PySide6 | >= 6.5 |
+| PySide6 | 6.12.0 |
 | xxhash | >= 3.0 |
 
 ## Usage
 
 ```bash
+python -m pip install -r requirements.txt
 python main.py
 ```
 
@@ -96,8 +97,12 @@ An individual source file can target either a folder or a specific file. When ta
 
 ## Build
 
+Use the same Python environment to install dependencies and build the executable.
+PySide6 6.12.0 with the Windows frame workaround was verified by moving the window between 100% and 175% scale monitors.
+
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name DataSynchronizer main.py
+python -m pip install -r requirements.txt pyinstaller
+python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 ```
 
 ## License
@@ -128,12 +133,13 @@ pyinstaller --noconfirm --onefile --windowed --name DataSynchronizer main.py
 | 依赖 | 版本 |
 |---|---|
 | Python | >= 3.10 |
-| PySide6 | >= 6.5 |
+| PySide6 | 6.12.0 |
 | xxhash | >= 3.0 |
 
 ## 使用方法
 
 ```bash
+python -m pip install -r requirements.txt
 python main.py
 ```
 
@@ -198,8 +204,12 @@ python main.py
 
 ## 打包
 
+请在同一个 Python 环境中安装依赖并打包。
+PySide6 6.12.0 配合 Windows 窗口 frame 修复，已通过 100% 与 175% 缩放屏幕之间的手动拖动验证。
+
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name DataSynchronizer main.py
+python -m pip install -r requirements.txt pyinstaller
+python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 ```
 
 ## 许可

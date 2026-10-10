@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from itertools import zip_longest
 
-from PySide6.QtCore import QRect, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QRect, QThread, QTimer, Qt, Signal, qWarning
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -320,6 +320,7 @@ class SyncWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._frame_dpr = self.devicePixelRatioF()
         self.config = load_config()
         self.current_lang = self.config.get(
             "default_language", DEFAULT_LANGUAGE
@@ -1006,6 +1007,41 @@ class MainWindow(QMainWindow):
             self.get_text("done_title"),
             self.get_text("sync_done_msg"),
         )
+
+    def event(self, event):
+        if (
+            event.type() == QEvent.Type.DevicePixelRatioChange
+            and hasattr(self, "_frame_dpr")
+        ):
+            self._refresh_frame_for_dpi()
+        return super().event(event)
+
+    def _refresh_frame_for_dpi(self):
+        dpr = self.devicePixelRatioF()
+        if dpr == self._frame_dpr:
+            return
+        self._frame_dpr = dpr
+        if QApplication.platformName() != "windows" or self.windowHandle() is None:
+            return
+        # QTBUG-142163: refresh frame metrics before Qt applies DPI-scaled
+        # geometry, without moving, resizing or activating the window.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            set_window_pos = ctypes.WinDLL("user32", use_last_error=True).SetWindowPos
+            set_window_pos.argtypes = (
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            )
+            set_window_pos.restype = wintypes.BOOL
+            # FRAMECHANGED | NOACTIVATE | NOMOVE | NOSIZE | NOZORDER | NOOWNERZORDER
+            flags = 0x0020 | 0x0010 | 0x0002 | 0x0001 | 0x0004 | 0x0200
+            if not set_window_pos(int(self.winId()), None, 0, 0, 0, 0, flags):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except (AttributeError, OSError) as exc:
+            qWarning(f"Could not refresh the window frame after DPI change: {exc}")
 
     def closeEvent(self, event):
         self._closing = True
