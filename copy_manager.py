@@ -61,7 +61,7 @@ class CopyManager(QObject):
         self._cancel_event.clear()
         self.failed_count = 0
         self.errors = []
-        self.ignore_rules = ignore_rules or IgnoreRules(DEFAULT_IGNORE_TEXT.splitlines())
+        self.ignore_rules = ignore_rules or IgnoreRules(global_lines=DEFAULT_IGNORE_TEXT.splitlines())
         diff_results = apply_ignore_rules(diff_results, self.ignore_rules)
         statuses = {"NEW", "MODIFIED"}
         if mirror_mode:
@@ -184,11 +184,12 @@ class CopyManager(QObject):
             else os.path.join(target_dir, rel_path)
         )
         normalized_rel = rel_path.replace("\\", "/")
+        rules = self.ignore_rules.for_pair(source_dir, target_dir, target_is_file)
 
         try:
             if self._cancel_event.is_set():
                 return None
-            if status not in ("NEW", "MODIFIED", "EXTRA", "EXTRA_DIR") or self.ignore_rules.matches(
+            if status not in ("NEW", "MODIFIED", "EXTRA", "EXTRA_DIR") or rules.matches(
                 rel_path, status == "EXTRA_DIR"
             ):
                 return None
@@ -199,7 +200,7 @@ class CopyManager(QObject):
                     return None
                 if status == "EXTRA_DIR":
                     if os.path.exists(target_path) and not self._remove_extra_directory(
-                        target_path, rel_path
+                        target_path, rel_path, rules
                     ):
                         return None
                     return (
@@ -265,9 +266,10 @@ class CopyManager(QObject):
         finally:
             self._advance_progress()
 
-    def _remove_extra_directory(self, path, rel_path):
+    def _remove_extra_directory(self, path, rel_path, rules=None):
         """Check rules again while deleting, including files added since scan."""
-        if self._cancel_event.is_set() or self.ignore_rules.matches(rel_path, True):
+        rules = rules if rules is not None else self.ignore_rules
+        if self._cancel_event.is_set() or rules.matches(rel_path, True):
             return False
         # Do not descend into Windows junctions or other directory links.
         path_stat = os.lstat(path)
@@ -287,10 +289,10 @@ class CopyManager(QObject):
                 return False
             child_rel = os.path.join(rel_path, entry.name)
             is_directory = entry.is_dir(follow_symlinks=False)
-            if self.ignore_rules.matches(child_rel, is_directory):
+            if rules.matches(child_rel, is_directory):
                 continue
             if is_directory:
-                self._remove_extra_directory(entry.path, child_rel)
+                self._remove_extra_directory(entry.path, child_rel, rules)
             else:
                 if is_read_only(entry.stat(follow_symlinks=False)):
                     continue

@@ -56,7 +56,7 @@ class SyncScanner(QObject):
     def __init__(self, db_path="sync_snapshot.db", ignore_rules=None):
         super().__init__()
         self.db_path = db_path
-        self.ignore_rules = ignore_rules or IgnoreRules(DEFAULT_IGNORE_TEXT.splitlines())
+        self.ignore_rules = ignore_rules or IgnoreRules(global_lines=DEFAULT_IGNORE_TEXT.splitlines())
         self._init_db()
 
     def _init_db(self):
@@ -194,6 +194,7 @@ class SyncScanner(QObject):
         is_cancelled = (
             cancel_event.is_set if cancel_event is not None else lambda: False
         )
+        rules = self.ignore_rules.for_pair(source_dir, target_dir, target_is_file)
         snapshots = {}
         if not verify_contents:
             with closing(sqlite3.connect(self.db_path)) as conn:
@@ -250,7 +251,9 @@ class SyncScanner(QObject):
             nonlocal scanned_count
             size = source_stat.st_size
             source_files.add(rel_path)
-            if self.ignore_rules.matches(rel_path):
+            if rules.global_matches(rel_path):
+                return
+            if rules.matches(rel_path):
                 add_difference("IGNORED", rel_path, source_path, size)
                 scanned_count += 1
                 return
@@ -326,8 +329,10 @@ class SyncScanner(QObject):
                             is_link = is_directory_link(entry, is_directory)
                             if is_link:
                                 is_directory = is_directory or entry.is_dir()
+                            if rules.global_matches(rel_path, is_directory):
+                                continue
 
-                            if is_link or self.ignore_rules.matches(rel_path, is_directory):
+                            if is_link or rules.matches(rel_path, is_directory):
                                 if is_directory:
                                     source_dirs.add(rel_path)
                                 else:
@@ -407,7 +412,10 @@ class SyncScanner(QObject):
                             except OSError:
                                 continue
 
-                            if is_link or self.ignore_rules.matches(rel_path, is_directory):
+                            if rules.global_matches(rel_path, is_directory):
+                                protect_parents(rel_path)
+                                continue
+                            if is_link or rules.matches(rel_path, is_directory):
                                 protect_parents(rel_path)
                                 if is_link or (rel_path not in source_dirs and rel_path not in source_files):
                                     try:

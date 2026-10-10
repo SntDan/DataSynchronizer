@@ -169,6 +169,20 @@ class DiffTreeModel(QAbstractItemModel):
 
     def update_differences(self, diffs):
         """Update scan-result metadata without moving rows or replacing nodes."""
+        retained = set()
+        for item in diffs:
+            pair_index = item[6] if len(item) >= 7 else None
+            parts = item[1].replace("\\", "/").split("/")
+            retained.update((pair_index, "/".join(parts[:end])) for end in range(len(parts) + 1))
+
+        def prune(parent):
+            for child in list(parent.children):
+                if (child.pair_index, child.rel_path) not in retained:
+                    self._remove_node(child)
+                else:
+                    prune(child)
+
+        prune(self.rootItem)
         changed_parents = set()
         for item in diffs:
             status, rel_path, abs_path, size = item[:4]
@@ -195,6 +209,27 @@ class DiffTreeModel(QAbstractItemModel):
                 first = self.createIndex(0, 0, children[0])
                 last = self.createIndex(len(children) - 1, 0, children[-1])
                 self.dataChanged.emit(first, last, [Qt.DisplayRole, Qt.ForegroundRole])
+
+    def _remove_node(self, node):
+        """Remove a hidden result while preserving indexes for remaining rows."""
+        parent = node.parent
+        current = list(parent.visible_children)
+        parent.children.remove(node)
+        del parent.children_dict[node.name]
+        parent._cached_visible = None
+        desired = list(parent.visible_children)
+        parent._cached_visible = current
+        parent_index = QModelIndex() if parent is self.rootItem else self.createIndex(parent.row(), 0, parent)
+        for row in range(len(current) - 1, -1, -1):
+            if current[row] not in desired:
+                self.beginRemoveRows(parent_index, row, row)
+                current.pop(row)
+                self.endRemoveRows()
+        for row, child in enumerate(desired):
+            if child not in current:
+                self.beginInsertRows(parent_index, row, row)
+                current.insert(row, child)
+                self.endInsertRows()
 
     def clear(self):
         self.beginResetModel()

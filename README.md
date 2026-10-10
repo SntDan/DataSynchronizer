@@ -22,7 +22,7 @@ A small PySide6 desktop tool for one-way file synchronization. It compares sourc
 - Preserve read-only target files and show pending differences as `[READ_ONLY]`
 - Treat `/`, `\`, and Windows path casing as the same snapshot identity
 - Switch between English and Simplified Chinese
-- Persist gitignore-style rules in `.syncignore`; show ignored items in a distinct gray
+- Persist global and pair-specific gitignore rules in `.syncignore`; hide global exclusions and show pair exclusions in gray
 - Right-click tree items to open them, reveal their location, or ignore them
 - Confirm before closing the window while scanning or synchronizing
 
@@ -95,7 +95,19 @@ Read-only target files with pending changes or mirror deletions appear as `[READ
 
 `.syncignore` lives beside `main.py` (or the packaged executable) and is created with default system-file exclusions if missing. Rules apply to paths relative to **each** source/target pair, on both sides. It supports gitignore syntax: comments (`#`), wildcards (`*.tmp`, `**/logs/`), root anchoring (`/report.txt`), directories (`cache/`), and exceptions (`!keep.tmp`). Windows matching is case insensitive. To include a file inside an ignored directory, first unignore the directory itself. For a single-file pair, rules match the original source filename, even if the target is renamed.
 
-Right-click a scan result and select **Ignore in Scans** to save its literal relative path to `.syncignore` and update the list immediately. The rule applies to that relative path in all pairs. Ignored files and directories remain visible in a distinct gray with `[IGNORED]` / `[IGNORED_DIR]` labels; ignored directories are not traversed. They are never copied or deleted, including in mirror mode. An extra directory containing ignored items is labeled `[PRESERVED_DIR]`; its unignored extras can still be deleted. Extra target directories are traversed during scanning to identify protected descendants. Edit `.syncignore` and scan again to remove or change exclusions. Rules are also reloaded before synchronizing.
+Rules before any scope header, or under `# @global`, apply to all pairs. Global exclusions are skipped without appearing in scan results, ignored totals or checked-file counts. The default system-file rules are global. A `# @pair {...}` header binds the following rules to the specified source, target and target type. Changing either path selects another scope; returning to the original pair restores its rules. Pair rules cannot override global exclusions.
+
+```gitignore
+# @global
+.DS_Store
+Thumbs.db
+
+# @pair {"source": "D:/Photos", "target": "E:/Backup/Photos", "target_is_file": false}
+/temporary/
+/private.txt
+```
+
+Right-click a scan result and select **Ignore in This Pair** or **Ignore Globally (Hide)** to save its literal relative path in the appropriate scope and update the list immediately. Pair exclusions remain visible in gray with `[IGNORED]` / `[IGNORED_DIR]` labels; global exclusions disappear. Ignored directories are not traversed. Both scopes protect files from copying and deletion, including mirror mode. An extra directory containing protected items is labeled `[PRESERVED_DIR]`; its unignored extras can still be deleted. Edit `.syncignore` and scan again to remove or change exclusions. Existing files without scope headers are read as global rules. Rules are reloaded before scanning and synchronizing.
 
 Closing the window during a scan or synchronization asks whether to stop the task and close. **No** is the default and leaves the task running; **Yes** cancels the task and waits for its workers to finish before exiting.
 
@@ -155,7 +167,7 @@ python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 - 保留只读目标文件，将待处理差异标记为 `[READ_ONLY]`
 - 正反斜杠和 Windows 路径大小写会按同一组快照识别
 - 支持英文和简体中文界面
-- 使用 `.syncignore` 持久保存类似 gitignore 的规则，忽略项用独立的灰色显示
+- 使用 `.syncignore` 保存全局和路径组忽略规则，全局忽略项隐藏，路径组忽略项显示为灰色
 - 树状列表右键可打开文件、定位文件和添加忽略规则
 - 扫描或同步过程中关闭窗口需要确认
 
@@ -228,7 +240,19 @@ python main.py
 
 `.syncignore` 位于 `main.py`（打包后为可执行文件）的同级目录；文件不存在时，会自动创建并写入默认系统文件忽略规则。规则相对于**每组**源路径和目标路径的根目录，对两端均生效。支持 gitignore 风格的注释（`#`）、通配符（`*.tmp`、`**/logs/`）、根路径匹配（`/report.txt`）、目录规则（`cache/`）和例外（`!keep.tmp`）。Windows 下匹配不区分大小写。若要保留被忽略目录内某个文件参与同步，需先取消对该目录本身的忽略。单文件组按源文件的原始文件名匹配，目标重命名不影响规则。
 
-在扫描结果中右键选择「在扫描中忽略」，会把该项目的准确相对路径保存到 `.syncignore`，并立即更新列表。同一相对路径的规则对所有路径组生效。忽略的文件和目录保留显示，用独立灰色和 `[IGNORED]` / `[IGNORED_DIR]` 标记；忽略目录不继续扫描内部内容。忽略项不会被复制或删除，镜像模式也会保留。包含忽略项的目标多余目录显示为 `[PRESERVED_DIR]`，其中未被忽略的多余项仍可删除。扫描会遍历目标多余目录，以识别其中需要保留的内容。手动修改 `.syncignore` 后重新扫描即可取消或调整忽略；同步前也会重新读取规则。
+文件开头未指定作用域的规则，以及 `# @global` 下面的规则，对所有路径组生效。全局忽略项直接跳过，不出现在扫描列表中，也不计入忽略数量或已检查文件数；默认的系统文件规则属于全局规则。`# @pair {...}` 下的规则绑定指定的源路径、目标路径和目标类型。源或目标改变时切换到另一作用域，切回原路径组时仍可使用原规则。路径组规则不能覆盖全局忽略。
+
+```gitignore
+# @global
+.DS_Store
+Thumbs.db
+
+# @pair {"source": "D:/照片", "target": "E:/备份/照片", "target_is_file": false}
+/临时文件/
+/private.txt
+```
+
+扫描结果右键可选择「仅在当前路径组忽略」或「全局忽略（不显示）」，把准确的相对路径保存到对应作用域，并立即更新列表。路径组忽略项保留灰色和 `[IGNORED]` / `[IGNORED_DIR]` 标记，全局忽略项从列表移除。忽略目录不继续遍历。两类忽略项均不会被复制或删除，镜像模式也会保留。包含保护项的目标多余目录显示为 `[PRESERVED_DIR]`，其中未被忽略的多余项仍可删除。手动修改 `.syncignore` 后重新扫描即可取消或调整忽略。旧文件没有作用域标记时按全局规则读取；扫描和同步前都会重新加载规则。
 
 扫描或同步时关闭窗口，会询问是否停止任务并关闭。默认选择「否」，任务继续执行；选择「是」后取消任务，等待工作线程退出再关闭程序。
 

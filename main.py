@@ -125,7 +125,8 @@ UI_TEXTS = {
         "open_file": "打开文件",
         "open_folder": "打开文件夹",
         "open_location": "打开文件所在位置",
-        "ignore_item": "在扫描中忽略",
+        "ignore_item": "仅在当前路径组忽略",
+        "ignore_global": "全局忽略（不显示）",
         "ignore_error": "无法读取或保存忽略规则：\n{}",
         "open_error": "无法打开路径：\n{}",
     },
@@ -200,7 +201,8 @@ UI_TEXTS = {
         "open_file": "Open File",
         "open_folder": "Open Folder",
         "open_location": "Open File Location",
-        "ignore_item": "Ignore in Scans",
+        "ignore_item": "Ignore in This Pair",
+        "ignore_global": "Ignore Globally (Hide)",
         "ignore_error": "Could not read or save ignore rules:\n{}",
         "open_error": "Could not open path:\n{}",
     },
@@ -1122,6 +1124,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         ignore_action = menu.addAction(self.get_text("ignore_item"))
         ignore_action.setEnabled(bool(node.rel_path) and node.status not in ("IGNORED", "IGNORED_DIR") and not self._task_running() and not self._closing)
+        global_ignore_action = menu.addAction(self.get_text("ignore_global"))
+        global_ignore_action.setEnabled(bool(node.rel_path) and not self._task_running() and not self._closing)
         # Capture values before the nested menu event loop can update the model.
         rel_path, pair_index, is_directory = node.rel_path, node.pair_index, node.is_directory
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
@@ -1131,6 +1135,8 @@ class MainWindow(QMainWindow):
             self._open_path(path, location=True)
         elif selected == ignore_action:
             self._ignore_path(rel_path, pair_index, path, is_directory)
+        elif selected == global_ignore_action:
+            self._ignore_path(rel_path, pair_index, path, is_directory, global_scope=True)
 
     def _open_path(self, path, location=False):
         try:
@@ -1143,16 +1149,19 @@ class MainWindow(QMainWindow):
         except OSError:
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("open_error", path))
 
-    def _ignore_path(self, rel_path, pair_index, path, is_directory):
+    def _ignore_path(self, rel_path, pair_index, path, is_directory, global_scope=False):
         if self._task_running() or self._closing:
             return
         try:
-            append_ignore_path(IGNORE_PATH, rel_path, is_directory)
+            append_ignore_path(
+                IGNORE_PATH, rel_path, is_directory,
+                pair=None if global_scope else self.directory_pairs[pair_index],
+            )
             rules = IgnoreRules.load(IGNORE_PATH)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("ignore_error", exc))
             return
-        if is_directory and not any(
+        if is_directory and not global_scope and not any(
             item[6] == pair_index
             and item[1].replace("\\", "/") == rel_path.replace("\\", "/")
             for item in self.diff_data_full
