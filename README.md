@@ -20,7 +20,7 @@ A small PySide6 desktop tool for one-way file synchronization. It compares sourc
 - Toggle between xxHash64 content verification and fast metadata scanning
 - Keep synchronization history in a local SQLite snapshot database
 - Preserve read-only target files and show pending differences as `[READ_ONLY]`
-- Treat `/`, `\`, and Windows path casing as the same snapshot identity
+- Treat `/`, `\`, and Windows path casing consistently in scans, ignore rules, tree items and snapshots
 - Switch between English and Simplified Chinese
 - Persist global and pair-specific gitignore rules in `.syncignore`; hide global exclusions and show pair exclusions in gray
 - Right-click tree items to open them, reveal their location, or ignore them
@@ -109,9 +109,15 @@ Thumbs.db
 
 Right-click a scan result and select **Ignore in This Pair** or **Ignore Globally (Hide)** to save its literal relative path in the appropriate scope and update the list immediately. Pair exclusions remain visible in gray with `[IGNORED]` / `[IGNORED_DIR]` labels; global exclusions disappear. Ignored directories are not traversed. Both scopes protect files from copying and deletion, including mirror mode. An extra directory containing protected items is labeled `[PRESERVED_DIR]`; its unignored extras can still be deleted. Edit `.syncignore` and scan again to remove or change exclusions. Existing files without scope headers are read as global rules. Rules are reloaded before scanning and synchronizing.
 
-Closing the window during a scan or synchronization asks whether to stop the task and close. **No** is the default and leaves the task running; **Yes** cancels the task and waits for its workers to finish before exiting.
+Scan-result classification and synchronization preparation run in the background. The synchronization confirmation appears after the reloaded ignore rules have been checked.
+
+Path groups are locked while a task runs. Editing paths or changing content verification invalidates the old results and requires another scan. Sources and targets must not contain one another; different groups must not share overlapping destinations or write into another group's source. Scanning does not create missing target folders.
+
+Closing the window during a scan, synchronization preparation or synchronization asks whether to stop the task and close. **No** is the default and leaves the task running; **Yes** cancels the task and waits for its workers to finish before exiting.
 
 The default ignore file is restored at startup if it has been deleted. Directory junctions and symbolic links are preserved without traversing them. A source read error stops the scan and prevents synchronizing partial results. Interrupted copies only resume after verifying that the target matches the source prefix; copy and snapshot errors are reported instead of showing success.
+
+Files are staged in the target folder and replaced only after a complete copy and change checks. Cancellation or read errors preserve the existing target. Staging needs temporary space for the complete file. Verified prefixes contribute directly to the copy hash, avoiding a second full source read. Configuration and ignore-file updates also use atomic replacement.
 
 Folders that contain differences are always shown. If one folder has many changed files, only the first 10 files are shown at first; click **... Show All** to expand them.
 
@@ -128,6 +134,7 @@ An individual source file can target either a folder or a specific file. When ta
 ├── copy_manager.py   # Copy/delete engine with resume support
 ├── ui_model.py       # Qt model for the diff tree
 ├── ignore_rules.py   # Gitignore-style matching and persistent rules
+├── storage.py        # Atomic configuration and ignore-file writes
 ├── .syncignore       # Editable scan/sync exclusions
 ├── config.json       # User configuration
 └── sync_snapshot.db  # Generated snapshot database
@@ -165,7 +172,7 @@ python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 - 可切换 xxHash64 内容校验与按文件属性快速扫描
 - 使用本地 SQLite 快照数据库记录同步历史
 - 保留只读目标文件，将待处理差异标记为 `[READ_ONLY]`
-- 正反斜杠和 Windows 路径大小写会按同一组快照识别
+- 扫描、忽略、树列表和快照统一处理正反斜杠及 Windows 路径大小写，避免误判多余文件
 - 支持英文和简体中文界面
 - 使用 `.syncignore` 保存全局和路径组忽略规则，全局忽略项隐藏，路径组忽略项显示为灰色
 - 树状列表右键可打开文件、定位文件和添加忽略规则
@@ -254,9 +261,15 @@ Thumbs.db
 
 扫描结果右键可选择「仅在当前路径组忽略」或「全局忽略（不显示）」，把准确的相对路径保存到对应作用域，并立即更新列表。路径组忽略项保留灰色和 `[IGNORED]` / `[IGNORED_DIR]` 标记，全局忽略项从列表移除。忽略目录不继续遍历。两类忽略项均不会被复制或删除，镜像模式也会保留。包含保护项的目标多余目录显示为 `[PRESERVED_DIR]`，其中未被忽略的多余项仍可删除。手动修改 `.syncignore` 后重新扫描即可取消或调整忽略。旧文件没有作用域标记时按全局规则读取；扫描和同步前都会重新加载规则。
 
-扫描或同步时关闭窗口，会询问是否停止任务并关闭。默认选择「否」，任务继续执行；选择「是」后取消任务，等待工作线程退出再关闭程序。
+扫描结果整理和同步准备在后台执行，重新检查忽略规则完成后才显示同步确认框。
+
+任务运行期间锁定路径组。修改路径或切换内容校验后，旧结果失效，需要重新扫描。源和目标不能互相包含；不同组的目标不能重叠，也不能覆盖其他组的源路径。扫描不会创建尚不存在的目标文件夹。
+
+扫描、同步准备或同步时关闭窗口，会询问是否停止任务并关闭。默认选择「否」，任务继续执行；选择「是」后取消任务，等待工作线程退出再关闭程序。
 
 忽略文件被删除后，下次启动会恢复默认文件。目录联接和符号链接会保留且不继续遍历。读取源目录出错时，中止扫描并禁止同步残缺结果。断点续传前会核对已有内容与源文件是否一致；复制和快照写入失败会明确提示，不会显示同步成功。
+
+文件先在目标文件夹中完整生成，通过变化检查后再替换原文件。取消或读取失败会保留原目标，因此需要容纳完整文件的临时空间。已验证的前缀直接参与复制哈希，不再额外重读整个源文件。配置和忽略文件也采用原子替换保存。
 
 所有包含差异的文件夹都会显示。单个文件夹内文件过多时，默认只显示前 10 个文件，点击 **... Show All** 可展开其余内容。
 
@@ -273,6 +286,7 @@ Thumbs.db
 ├── copy_manager.py   # 复制和删除逻辑，支持续传
 ├── ui_model.py       # 差异树的 Qt 数据模型
 ├── ignore_rules.py   # Gitignore 风格匹配和忽略规则保存
+├── storage.py        # 配置和忽略文件的原子保存
 ├── .syncignore       # 可编辑的扫描和同步忽略规则
 ├── config.json       # 用户配置
 └── sync_snapshot.db  # 自动生成的快照数据库

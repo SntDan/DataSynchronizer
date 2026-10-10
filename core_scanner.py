@@ -7,7 +7,7 @@ from contextlib import closing
 import xxhash
 from PySide6.QtCore import QObject, Signal
 
-from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules
+from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules, relative_path_key
 
 
 def canonical_directory(path):
@@ -38,7 +38,7 @@ def is_read_only(file_stat):
     )
 
 
-def _file_signature(file_stat):
+def file_signature(file_stat):
     result = (
         file_stat.st_size, file_stat.st_mtime_ns,
         file_stat.st_dev, file_stat.st_ino,
@@ -93,6 +93,9 @@ class SyncScanner(QObject):
             else:
                 self._create_snapshot_table(conn)
             self._canonicalize_snapshot_directories(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS snapshot_pair ON file_snapshot(src_dir, dst_dir)"
+            )
 
     @staticmethod
     def _create_snapshot_table(conn):
@@ -115,11 +118,11 @@ class SyncScanner(QObject):
         groups = conn.execute(
             "SELECT DISTINCT src_dir, dst_dir FROM file_snapshot"
         ).fetchall()
-        if all(
-            src_dir == canonical_directory(src_dir)
-            and dst_dir == canonical_directory(dst_dir)
-            for src_dir, dst_dir in groups
-        ):
+        canonical_pairs = {
+            (source, target): (canonical_directory(source), canonical_directory(target))
+            for source, target in groups
+        }
+        if all(pair == canonical for pair, canonical in canonical_pairs.items()):
             return
 
         rows = conn.execute(
@@ -130,8 +133,7 @@ class SyncScanner(QObject):
         ).fetchall()
         rows.sort(
             key=lambda row: (
-                row[1] == canonical_directory(row[1])
-                and row[2] == canonical_directory(row[2])
+                (row[1], row[2]) == canonical_pairs[(row[1], row[2])]
             )
         )
         conn.execute("DELETE FROM file_snapshot")
@@ -145,17 +147,16 @@ class SyncScanner(QObject):
                 mtime=excluded.mtime,
                 file_hash=excluded.file_hash
             """,
-            [
+            (
                 (
                     path,
-                    canonical_directory(src_dir),
-                    canonical_directory(dst_dir),
+                    *canonical_pairs[(src_dir, dst_dir)],
                     size,
                     mtime,
                     file_hash,
                 )
                 for path, src_dir, dst_dir, size, mtime, file_hash in rows
-            ],
+            ),
         )
 
     @staticmethod
@@ -167,7 +168,7 @@ class SyncScanner(QObject):
         hasher = xxhash.xxh64()
         with open(filepath, "rb") as file_obj:
             before = os.fstat(file_obj.fileno())
-            if expected_stat is not None and _file_signature(before) != _file_signature(expected_stat):
+            if expected_stat is not None and file_signature(before) != file_signature(expected_stat):
                 raise OSError(f"File changed before verification: {filepath}")
             while True:
                 if is_cancelled():
@@ -176,9 +177,9 @@ class SyncScanner(QObject):
                 if not chunk:
                     break
                 hasher.update(chunk)
-            if _file_signature(os.fstat(file_obj.fileno())) != _file_signature(before):
+            if file_signature(os.fstat(file_obj.fileno())) != file_signature(before):
                 raise OSError(f"File changed during verification: {filepath}")
-        if _file_signature(os.stat(filepath)) != _file_signature(before):
+        if file_signature(os.stat(filepath)) != file_signature(before):
             raise OSError(f"File changed during verification: {filepath}")
         return hasher.hexdigest()
 
@@ -199,7 +200,7 @@ class SyncScanner(QObject):
         if not verify_contents:
             with closing(sqlite3.connect(self.db_path)) as conn:
                 snapshots = {
-                    path: (size, mtime)
+                    relative_path_key(path): (size, mtime)
                     for path, size, mtime in conn.execute(
                         "SELECT path, size, mtime FROM file_snapshot WHERE src_dir=? AND dst_dir=?",
                         (canonical_directory(source_dir), canonical_directory(target_dir)),
@@ -247,16 +248,27 @@ class SyncScanner(QObject):
                 self.diff_batch_found.emit(list(differences))
                 differences.clear()
 
+        def ignore_source_entry(source_path, rel_path, is_directory, is_link, get_stat):
+            nonlocal scanned_count
+            if rules.global_matches(rel_path, is_directory):
+                return True
+            if not is_link and not rules.pair_matches(rel_path, is_directory):
+                return False
+            (source_dirs if is_directory else source_files).add(relative_path_key(rel_path))
+            try:
+                size = 0 if is_directory else get_stat().st_size
+            except OSError:
+                size = 0
+            add_difference("IGNORED_DIR" if is_directory else "IGNORED", rel_path, source_path, size)
+            scanned_count += 1
+            report_progress()
+            return True
+
         def compare_source_file(source_path, rel_path, source_stat):
             nonlocal scanned_count
             size = source_stat.st_size
-            source_files.add(rel_path)
-            if rules.global_matches(rel_path):
-                return
-            if rules.matches(rel_path):
-                add_difference("IGNORED", rel_path, source_path, size)
-                scanned_count += 1
-                return
+            rel_key = relative_path_key(rel_path)
+            source_files.add(rel_key)
             target_path = (
                 target_dir
                 if target_is_file
@@ -274,7 +286,7 @@ class SyncScanner(QObject):
                     return
                 if not stat.S_ISREG(target_stat.st_mode):
                     raise OSError(f"Target is not a regular file: {target_path}")
-                snapshot = snapshots.get(rel_path.replace("\\", "/"))
+                snapshot = snapshots.get(rel_key)
                 if not verify_contents:
                     source_changed = (
                         snapshot != (size, source_stat.st_mtime)
@@ -294,7 +306,7 @@ class SyncScanner(QObject):
                     if target_hash is None:
                         return
                     for path, initial_stat in ((source_path, source_stat), (target_path, target_stat)):
-                        if _file_signature(os.stat(path)) != _file_signature(initial_stat):
+                        if file_signature(os.stat(path)) != file_signature(initial_stat):
                             raise OSError(f"File changed during verification: {path}")
                     if source_hash != target_hash:
                         status = "MODIFIED"
@@ -329,28 +341,13 @@ class SyncScanner(QObject):
                             is_link = is_directory_link(entry, is_directory)
                             if is_link:
                                 is_directory = is_directory or entry.is_dir()
-                            if rules.global_matches(rel_path, is_directory):
-                                continue
-
-                            if is_link or rules.matches(rel_path, is_directory):
-                                if is_directory:
-                                    source_dirs.add(rel_path)
-                                else:
-                                    source_files.add(rel_path)
-                                try:
-                                    size = 0 if is_directory else entry.stat(
-                                        follow_symlinks=False
-                                    ).st_size
-                                except OSError:
-                                    size = 0
-                                add_difference(
-                                    "IGNORED_DIR" if is_directory else "IGNORED",
-                                    rel_path, entry.path, size,
-                                )
-                                scanned_count += 1
+                            if ignore_source_entry(
+                                entry.path, rel_path, is_directory, is_link,
+                                lambda: entry.stat(follow_symlinks=False),
+                            ):
                                 continue
                             if is_directory:
-                                source_dirs.add(rel_path)
+                                source_dirs.add(relative_path_key(rel_path))
                                 try:
                                     target_stat = os.lstat(os.path.join(target_dir, rel_path))
                                 except FileNotFoundError:
@@ -374,11 +371,9 @@ class SyncScanner(QObject):
                     raise OSError(f"Could not scan {current_path}: {exc}") from exc
 
         elif os.path.isfile(source_dir):
-            compare_source_file(
-                source_dir,
-                os.path.basename(source_dir),
-                os.stat(source_dir),
-            )
+            rel_path = os.path.basename(source_dir)
+            if not ignore_source_entry(source_dir, rel_path, False, False, lambda: os.stat(source_dir)):
+                compare_source_file(source_dir, rel_path, os.stat(source_dir))
 
         # A single-file pair only owns its same-named target file. It must not
         # treat unrelated contents of the target directory as mirror extras.
@@ -402,6 +397,7 @@ class SyncScanner(QObject):
                                 if current_rel
                                 else entry.name
                             )
+                            rel_key = relative_path_key(rel_path)
                             try:
                                 is_directory = entry.is_dir(
                                     follow_symlinks=False
@@ -415,9 +411,9 @@ class SyncScanner(QObject):
                             if rules.global_matches(rel_path, is_directory):
                                 protect_parents(rel_path)
                                 continue
-                            if is_link or rules.matches(rel_path, is_directory):
+                            if is_link or rules.pair_matches(rel_path, is_directory):
                                 protect_parents(rel_path)
-                                if is_link or (rel_path not in source_dirs and rel_path not in source_files):
+                                if is_link or (rel_key not in source_dirs and rel_key not in source_files):
                                     try:
                                         size = 0 if is_directory else entry.stat(
                                             follow_symlinks=False
@@ -430,12 +426,12 @@ class SyncScanner(QObject):
                                     )
                                 continue
                             if is_directory:
-                                if rel_path not in source_dirs:
+                                if rel_key not in source_dirs:
                                     extra_directories.append((rel_path, entry.path))
                                 stack.append((entry.path, rel_path))
                                 continue
 
-                            if rel_path not in source_files:
+                            if rel_key not in source_files:
                                 target_stat = entry.stat(follow_symlinks=False)
                                 size = target_stat.st_size
                                 status = "READ_ONLY" if is_read_only(target_stat) else "EXTRA"
@@ -446,8 +442,7 @@ class SyncScanner(QObject):
                                 )
 
                             scanned_count += 1
-                            if scanned_count % 500 == 0:
-                                self.progress_updated.emit(scanned_count)
+                            report_progress()
                 except OSError:
                     protected_dirs.add(current_rel)
                     protect_parents(current_rel)

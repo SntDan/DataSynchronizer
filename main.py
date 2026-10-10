@@ -3,7 +3,6 @@ import os
 import sys
 import threading
 import subprocess
-import tempfile
 from pathlib import Path
 from itertools import zip_longest
 
@@ -39,7 +38,8 @@ from PySide6.QtWidgets import (
 from copy_manager import CopyManager
 from core_scanner import SyncScanner
 from ui_model import DiffTreeModel
-from ignore_rules import IgnoreRules, append_ignore_path, apply_ignore_rules
+from ignore_rules import IgnoreRules, append_ignore_path, apply_ignore_rules, relative_path_key
+from storage import write_text_atomic
 
 
 APP_DIR = (
@@ -108,7 +108,8 @@ UI_TEXTS = {
         "warn_title": "警告",
         "warn_empty": "请至少设置一组源路径和目标路径。",
         "warn_source": "源文件或目录不存在：\n{}",
-        "warn_target": "无法创建目标目录：\n{}",
+        "warn_overlap": "第 {} 组的源路径和目标路径不能互相包含。",
+        "warn_pair_overlap": "第 {} 组和第 {} 组的路径冲突，请避免目标重叠或覆盖其他组的源路径。",
         "warn_dir_to_file": "第 {} 组不能把源目录同步到单个目标文件。",
         "warn_same": "第 {} 组的源目录和目标目录不能相同。",
         "warn_same_file": "第 {} 组的目标不能指向源文件本身。",
@@ -180,7 +181,8 @@ UI_TEXTS = {
         "warn_title": "Warning",
         "warn_empty": "Please specify at least one source and target path pair.",
         "warn_source": "Source file or directory does not exist:\n{}",
-        "warn_target": "Could not create target directory:\n{}",
+        "warn_overlap": "Source and target in pair {} cannot contain one another.",
+        "warn_pair_overlap": "Pairs {} and {} conflict. Targets must not overlap or cover another pair's source.",
         "warn_dir_to_file": (
             "Pair {} cannot synchronize a source directory to one file."
         ),
@@ -220,6 +222,8 @@ def load_config():
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
+        if not isinstance(data, dict):
+            raise ValueError("configuration must be an object")
         workers = data.get("copy_workers", 4)
         default_language = str(
             data.get("default_language", DEFAULT_LANGUAGE)
@@ -271,24 +275,22 @@ def load_config():
         except OSError:
             pass
         return default_config
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, OverflowError):
         return default_config
 
 
 def _write_config(data):
-    temporary_path = None
+    write_text_atomic(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def paths_overlap(left, left_is_directory, right, right_is_directory):
+    left = os.path.normcase(os.path.realpath(left))
+    right = os.path.normcase(os.path.realpath(right))
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=CONFIG_PATH.parent,
-            prefix=".config-", suffix=".tmp", delete=False,
-        ) as file_obj:
-            temporary_path = Path(file_obj.name)
-            json.dump(data, file_obj, ensure_ascii=False, indent=2)
-            file_obj.write("\n")
-        os.replace(temporary_path, CONFIG_PATH)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        common = os.path.commonpath((left, right))
+    except ValueError:
+        return False
+    return left == right or (left_is_directory and common == left) or (right_is_directory and common == right)
 
 
 class SettingsDialog(QDialog):
@@ -299,6 +301,7 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 16)
         layout.setSpacing(16)
         self.mirror_checkbox = QCheckBox(parent.get_text("mirror_chk"))
+        self.mirror_checkbox.setStyleSheet("QCheckBox:checked { color: red; }")
         self.mirror_checkbox.setChecked(parent.mirror_mode)
         self.verify_checkbox = QCheckBox(parent.get_text("verify_chk"))
         self.verify_checkbox.setToolTip(parent.get_text("verify_tip"))
@@ -391,12 +394,15 @@ class SyncWorker(QThread):
         self.verify_contents = verify_contents
         self.cancel_event = threading.Event()
         self.was_cancelled = False
+        self.differences = []
 
     def cancel(self):
         self.cancel_event.set()
 
     def run(self):
         total = len(self.directory_pairs)
+        collect = self.differences.extend
+        self.scanner.diff_batch_found.connect(collect, Qt.DirectConnection)
         try:
             for index, pair in enumerate(self.directory_pairs):
                 source_dir, target_dir, target_is_file = pair
@@ -415,8 +421,34 @@ class SyncWorker(QThread):
                 if self.cancel_event.is_set():
                     self.was_cancelled = True
                     return
+            self.differences = apply_ignore_rules(
+                self.differences, self.scanner.ignore_rules, self.cancel_event
+            )
+            self.was_cancelled = self.cancel_event.is_set()
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            self.scanner.diff_batch_found.disconnect(collect)
+
+
+class SyncPreparationWorker(QThread):
+    """Reloaded rules are applied before confirmation without blocking the UI."""
+
+    def __init__(self, differences, rules):
+        super().__init__()
+        self.differences = differences
+        self.rules = rules
+        self.cancel_event = threading.Event()
+        self.error = None
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def run(self):
+        try:
+            self.differences = apply_ignore_rules(self.differences, self.rules, self.cancel_event)
+        except Exception as exc:
+            self.error = str(exc)
 
 
 class MainWindow(QMainWindow):
@@ -439,6 +471,7 @@ class MainWindow(QMainWindow):
         self.status_args = ()
         self._closing = False
         self._close_prompt_open = False
+        self._scan_consumed = False
 
         self.init_ui()
         self.init_logic()
@@ -577,6 +610,8 @@ class MainWindow(QMainWindow):
         adjust_window=True,
         target_type="",
     ):
+        if hasattr(self, "copy_mgr") and (self._task_running() or self._closing):
+            return
         row_widget = QFrame()
         row_widget.setObjectName("directoryGroup")
         row_widget.setStyleSheet(
@@ -641,6 +676,8 @@ class MainWindow(QMainWindow):
         target_input.editingFinished.connect(
             lambda: self._show_path_end(target_input)
         )
+        source_input.textChanged.connect(self._invalidate_scan)
+        target_input.textChanged.connect(self._invalidate_scan)
 
         row_layout.addWidget(group_label)
         row_layout.addWidget(source_input, 1)
@@ -657,7 +694,6 @@ class MainWindow(QMainWindow):
             "source_change": source_change,
             "source_folder_action": source_folder_action,
             "source_file_action": source_file_action,
-            "direction_label": direction_label,
             "target_input": target_input,
             "target_change": target_change,
             "target_folder_action": target_folder_action,
@@ -690,8 +726,11 @@ class MainWindow(QMainWindow):
         self.groups_layout.addWidget(row_widget)
         self._update_group_row_texts()
         self._adjust_group_area(adjust_window)
+        self._invalidate_scan()
 
     def remove_directory_group(self, row):
+        if self._task_running() or self._closing:
+            return
         if len(self.path_rows) == 1:
             row["source_input"].clear()
             row["target_input"].clear()
@@ -702,8 +741,11 @@ class MainWindow(QMainWindow):
         row["widget"].deleteLater()
         self._update_group_row_texts()
         self._adjust_group_area(True)
+        self._invalidate_scan()
 
     def change_directory(self, editor, title_key, path_type=None):
+        if self._task_running() or self._closing:
+            return
         path = QFileDialog.getExistingDirectory(
             self, self.get_text(title_key), editor.text()
         )
@@ -712,10 +754,13 @@ class MainWindow(QMainWindow):
             if path_type:
                 editor.setProperty("path_type", path_type)
             self._show_path_end(editor)
+            self._invalidate_scan()
 
     def change_file(
         self, editor, title_key, save=False, path_type=None
     ):
+        if self._task_running() or self._closing:
+            return
         current_path = editor.text().strip()
         start_path = (
             current_path
@@ -733,6 +778,7 @@ class MainWindow(QMainWindow):
             if path_type:
                 editor.setProperty("path_type", path_type)
             self._show_path_end(editor)
+            self._invalidate_scan()
 
     @staticmethod
     def _show_path_end(editor):
@@ -791,7 +837,6 @@ class MainWindow(QMainWindow):
             )
         self.scanner.progress_updated.connect(self.on_scan_progress)
         self.scanner.file_check_started.connect(self.on_scan_file_check)
-        self.scanner.diff_batch_found.connect(self.on_diff_batch)
 
         self.copy_mgr = CopyManager(
             str(DB_PATH), max_workers=self.config["copy_workers"]
@@ -849,6 +894,8 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
 
     def save_settings(self, verify_contents, mirror_mode):
+        if self._task_running() or self._closing:
+            return
         try:
             with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
                 data = json.load(file_obj)
@@ -859,10 +906,42 @@ class MainWindow(QMainWindow):
         data.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
         _write_config(data)
         self.config.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        verification_changed = self.verify_contents != verify_contents
         self.verify_contents = verify_contents
         self.mirror_mode = mirror_mode
         self.list_model.set_is_mirror_mode(mirror_mode)
+        if verification_changed:
+            self._invalidate_scan()
         self._update_sync_enabled()
+
+    def _clear_scan_results(self):
+        self.diff_data_full = []
+        self.directory_pairs = []
+        self.list_model.clear()
+        self.scan_error = None
+        self._scan_consumed = False
+        self.sync_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+    def _invalidate_scan(self):
+        if not hasattr(self, "copy_mgr") or self._task_running() or self._closing:
+            return
+        if self.directory_pairs or self.diff_data_full:
+            self._clear_scan_results()
+            self.set_status("ready")
+
+    def _set_task_busy(self, busy, scanning=False):
+        self.groups_container.setEnabled(not busy)
+        self.add_group_btn.setEnabled(not busy)
+        self.scan_btn.setEnabled(not busy)
+        self.settings_btn.setEnabled(not busy)
+        self.stop_btn.setVisible(busy and scanning)
+        self.stop_btn.setEnabled(busy and scanning)
+        if busy:
+            self.sync_btn.setEnabled(False)
+        else:
+            self._update_sync_enabled()
 
     def _validated_pairs(self):
         if not self.path_rows:
@@ -873,7 +952,7 @@ class MainWindow(QMainWindow):
             )
             return None
 
-        pairs = []
+        pairs, owned_paths = [], []
         for index, row in enumerate(self.path_rows, start=1):
             source = row["source_input"].text().strip()
             target = row["target_input"].text().strip()
@@ -890,7 +969,8 @@ class MainWindow(QMainWindow):
             target = os.path.normpath(
                 os.path.abspath(os.path.expandvars(os.path.expanduser(target)))
             )
-            if not os.path.isdir(source) and not os.path.isfile(source):
+            source_is_directory = os.path.isdir(source)
+            if not source_is_directory and not os.path.isfile(source):
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
@@ -903,7 +983,7 @@ class MainWindow(QMainWindow):
             elif os.path.isdir(target):
                 target_is_file = False
 
-            if os.path.isdir(source) and target_is_file:
+            if source_is_directory and target_is_file:
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
@@ -911,42 +991,32 @@ class MainWindow(QMainWindow):
                 )
                 return None
 
-            target_parent = os.path.dirname(target) if target_is_file else target
-            try:
-                os.makedirs(target_parent, exist_ok=True)
-            except OSError:
-                QMessageBox.warning(
-                    self,
-                    self.get_text("warn_title"),
-                    self.get_text("warn_target", target_parent),
-                )
-                return None
-
-            if os.path.isdir(source):
-                same_destination = (
-                    os.path.normcase(source) == os.path.normcase(target)
-                )
-            else:
-                target_file = (
-                    target
-                    if target_is_file
-                    else os.path.join(target, os.path.basename(source))
-                )
-                same_destination = (
-                    os.path.normcase(source) == os.path.normcase(target_file)
-                )
-            if same_destination:
+            destination = target if source_is_directory or target_is_file else os.path.join(target, os.path.basename(source))
+            if paths_overlap(source, source_is_directory, destination, source_is_directory):
+                same_destination = os.path.normcase(source) == os.path.normcase(destination)
                 QMessageBox.warning(
                     self,
                     self.get_text("warn_title"),
                     self.get_text(
-                        "warn_same_file" if os.path.isfile(source) else "warn_same",
+                        ("warn_same" if source_is_directory else "warn_same_file") if same_destination else "warn_overlap",
                         index,
                     ),
                 )
                 return None
 
+            for other_index, (other_source, other_destination, other_is_directory) in enumerate(owned_paths, start=1):
+                if (
+                    paths_overlap(destination, source_is_directory, other_destination, other_is_directory)
+                    or paths_overlap(source, source_is_directory, other_destination, other_is_directory)
+                    or paths_overlap(destination, source_is_directory, other_source, other_is_directory)
+                ):
+                    QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("warn_pair_overlap", other_index, index))
+                    return None
+            owned_paths.append((source, destination, source_is_directory))
+
             pairs.append((source, target, target_is_file))
+        # Normalize editors only after all pairs have passed validation.
+        for row, (source, target, target_is_file) in zip(self.path_rows, pairs):
             row["source_input"].setText(source)
             row["target_input"].setText(target)
             row["target_input"].setProperty(
@@ -968,19 +1038,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("ignore_error", exc))
             return
 
+        self._clear_scan_results()
         self.directory_pairs = pairs
-        self.diff_data_full.clear()
-        self.list_model.clear()
-        self.scan_error = None
         self.current_scan_pair = 1
         self.total_scan_pairs = len(pairs)
         self.set_status("scanning", 1, len(pairs))
         self.progress_bar.setRange(0, 0)
-        self.scan_btn.setEnabled(False)
-        self.settings_btn.setEnabled(False)
-        self.sync_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.stop_btn.setVisible(True)
+        self._set_task_busy(True, scanning=True)
 
         self.scan_worker = SyncWorker(self.scanner, pairs, self.verify_contents)
         self.scan_worker.pair_started.connect(self.on_pair_started)
@@ -1002,9 +1066,6 @@ class MainWindow(QMainWindow):
         self.current_scan_pair = current
         self.total_scan_pairs = total
         self.set_status("scanning", current, total)
-
-    def on_diff_batch(self, differences):
-        self.diff_data_full.extend(differences)
 
     def on_scan_progress(self, count):
         if self.scan_worker.cancel_event.is_set():
@@ -1028,31 +1089,25 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self.progress_bar.setRange(0, 100)
-        self.scan_btn.setEnabled(True)
-        self.settings_btn.setEnabled(True)
-        self.stop_btn.setVisible(False)
+        self._set_task_busy(False)
         if self.scan_worker.was_cancelled:
-            self.diff_data_full.clear()
-            self.list_model.clear()
-            self.progress_bar.setValue(0)
-            self.sync_btn.setEnabled(False)
+            self._clear_scan_results()
             self.set_status("scan_stopped")
             return
 
         self.progress_bar.setValue(100)
         if self.scan_error:
-            self.diff_data_full.clear()
-            self.list_model.clear()
-            self.sync_btn.setEnabled(False)
-            self.set_status("scan_error", self.scan_error)
+            error = self.scan_error
+            self._clear_scan_results()
+            self.set_status("scan_error", error)
             QMessageBox.warning(
                 self,
                 self.get_text("warn_title"),
-                self.get_text("scan_error", self.scan_error),
+                self.get_text("scan_error", error),
             )
             return
 
-        self.diff_data_full = apply_ignore_rules(self.diff_data_full, self.scanner.ignore_rules)
+        self.diff_data_full = self.scan_worker.differences
         if self.diff_data_full:
             self.list_model.add_batch(self.diff_data_full)
 
@@ -1085,14 +1140,22 @@ class MainWindow(QMainWindow):
         return counts
 
     def _task_running(self):
-        worker = getattr(self, "scan_worker", None)
-        return (worker is not None and worker.isRunning()) or self.copy_mgr.is_syncing
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (
+                getattr(self, "scan_worker", None),
+                getattr(self, "sync_preparation_worker", None),
+            )
+        ) or self.copy_mgr.is_syncing
 
     def _update_sync_enabled(self):
         statuses = {"NEW", "MODIFIED"}
         if self.mirror_mode:
             statuses.update(("EXTRA", "EXTRA_DIR"))
-        self.sync_btn.setEnabled(any(item[0] in statuses for item in self.diff_data_full))
+        self.sync_btn.setEnabled(
+            not self._scan_consumed and not self._closing and not self._task_running()
+            and any(item[0] in statuses for item in self.diff_data_full)
+        )
 
     def _node_path(self, node):
         if node.abs_path:
@@ -1129,6 +1192,7 @@ class MainWindow(QMainWindow):
         # Capture values before the nested menu event loop can update the model.
         rel_path, pair_index, is_directory = node.rel_path, node.pair_index, node.is_directory
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
+        menu.deleteLater()
         if selected == open_action:
             self._open_path(path)
         elif selected == location_action:
@@ -1150,20 +1214,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("open_error", path))
 
     def _ignore_path(self, rel_path, pair_index, path, is_directory, global_scope=False):
-        if self._task_running() or self._closing:
+        if self._task_running() or self._closing or not 0 <= pair_index < len(self.directory_pairs):
             return
         try:
-            append_ignore_path(
+            rules = append_ignore_path(
                 IGNORE_PATH, rel_path, is_directory,
                 pair=None if global_scope else self.directory_pairs[pair_index],
             )
-            rules = IgnoreRules.load(IGNORE_PATH)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("ignore_error", exc))
             return
         if is_directory and not global_scope and not any(
             item[6] == pair_index
-            and item[1].replace("\\", "/") == rel_path.replace("\\", "/")
+            and relative_path_key(item[1]) == relative_path_key(rel_path)
             for item in self.diff_data_full
         ):
             source, target, target_is_file = self.directory_pairs[pair_index]
@@ -1207,7 +1270,25 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("ignore_error", exc))
             return
-        self.diff_data_full = apply_ignore_rules(self.diff_data_full, rules)
+        self._set_task_busy(True)
+        self.progress_bar.setRange(0, 0)
+        self.set_status("start_sync")
+        self.sync_preparation_worker = SyncPreparationWorker(self.diff_data_full, rules)
+        self.sync_preparation_worker.finished.connect(self.on_sync_prepared)
+        self.sync_preparation_worker.start()
+
+    def on_sync_prepared(self):
+        if self._closing:
+            return
+        worker = self.sync_preparation_worker
+        self._set_task_busy(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        if worker.error:
+            self._update_sync_enabled()
+            QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("ignore_error", worker.error))
+            return
+        self.diff_data_full = worker.differences
         self._refresh_differences()
         if not self.sync_btn.isEnabled():
             return
@@ -1243,16 +1324,14 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes or self._closing:
             return
 
-        self.scan_btn.setEnabled(False)
-        self.settings_btn.setEnabled(False)
-        self.sync_btn.setEnabled(False)
+        self._set_task_busy(True)
         self.set_status("start_sync")
         self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
         self.progress_bar.setValue(0)
         self.copy_mgr.start_sync(
             self.diff_data_full,
             mirror_mode=is_mirror,
-            ignore_rules=rules,
+            ignore_rules=worker.rules,
         )
 
     def on_copy_overall_progress(self, current, total):
@@ -1264,9 +1343,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self.progress_bar.setValue(self.progress_bar.maximum())
-        self.scan_btn.setEnabled(True)
-        self.settings_btn.setEnabled(True)
-        self.sync_btn.setEnabled(False)
+        self._scan_consumed = True
+        self._set_task_busy(False)
         if self.copy_mgr.failed_count:
             self.set_status("sync_failed", self.copy_mgr.failed_count)
             if not self._close_prompt_open:
@@ -1320,13 +1398,17 @@ class MainWindow(QMainWindow):
             qWarning(f"Could not refresh the window frame after DPI change: {exc}")
 
     def closeEvent(self, event):
-        scan_running = (
-            hasattr(self, "scan_worker") and self.scan_worker.isRunning()
-        )
+        workers = [
+            worker for worker in (
+                getattr(self, "scan_worker", None),
+                getattr(self, "sync_preparation_worker", None),
+            )
+            if worker is not None and worker.isRunning()
+        ]
         if self._close_prompt_open:
             event.ignore()
             return
-        if (scan_running or self.copy_mgr.is_syncing) and not self._closing:
+        if (workers or self.copy_mgr.is_syncing) and not self._closing:
             self._close_prompt_open = True
             try:
                 reply = QMessageBox.question(
@@ -1342,12 +1424,12 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._closing = True
-        if scan_running:
-            self.scan_worker.cancel()
+        for worker in workers:
+            worker.cancel()
         if self.copy_mgr.is_syncing:
             self.copy_mgr.cancel()
 
-        if scan_running or self.copy_mgr.is_syncing:
+        if workers or self.copy_mgr.is_syncing:
             event.ignore()
             self.hide()
             QTimer.singleShot(50, self._close_when_workers_finish)
@@ -1356,10 +1438,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _close_when_workers_finish(self):
-        scan_running = (
-            hasattr(self, "scan_worker") and self.scan_worker.isRunning()
-        )
-        if scan_running or self.copy_mgr.is_syncing:
+        if self._task_running():
             QTimer.singleShot(50, self._close_when_workers_finish)
             return
         QApplication.quit()

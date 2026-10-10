@@ -2,9 +2,11 @@
 
 import os
 import json
+from functools import lru_cache
 from pathlib import Path
 
 from pathspec import GitIgnoreSpec
+from storage import write_text_atomic
 
 
 DEFAULT_IGNORE_TEXT = """# DataSynchronizer ignore rules (relative to each path pair).
@@ -20,11 +22,19 @@ $RECYCLE.BIN/
 """
 
 
+def relative_path_key(path):
+    path = path.replace("\\", "/")
+    return path.lower() if os.name == "nt" else path
+
+
 class IgnoreRules:
     def __init__(self, lines=(), *, global_lines=(), pair_lines=None):
         self.global_lines = list(global_lines)
         self.global_spec = self._compile(self.global_lines)
         self.spec = self._compile(lines)
+        # Siblings share directory prefixes; bound both caches for large scans.
+        self._global_directory_matches = lru_cache(maxsize=4096)(self.global_spec.match_file)
+        self._pair_directory_matches = lru_cache(maxsize=4096)(self.spec.match_file)
         self.pair_lines = pair_lines
         self._pairs = {}
 
@@ -40,10 +50,14 @@ class IgnoreRules:
     def load(cls, path):
         path = Path(path)
         if not path.exists():
-            path.write_text(DEFAULT_IGNORE_TEXT, encoding="utf-8")
+            write_text_atomic(path, DEFAULT_IGNORE_TEXT)
+        return cls.from_text(path.read_text(encoding="utf-8-sig"))
+
+    @classmethod
+    def from_text(cls, text):
         global_lines, pairs = [], {}
         current_lines = global_lines
-        for line in path.read_text(encoding="utf-8-sig").splitlines():
+        for line in text.splitlines():
             marker = line.strip()
             if marker == "# @global":
                 current_lines = global_lines
@@ -72,22 +86,25 @@ class IgnoreRules:
         return self._pairs[key]
 
     def global_matches(self, rel_path, is_directory=False):
-        return self._matches(self.global_spec, rel_path, is_directory)
+        return self._matches(self.global_spec, self._global_directory_matches, rel_path, is_directory)
+
+    def pair_matches(self, rel_path, is_directory=False):
+        return self._matches(self.spec, self._pair_directory_matches, rel_path, is_directory)
 
     def matches(self, rel_path, is_directory=False):
-        return self.global_matches(rel_path, is_directory) or self._matches(self.spec, rel_path, is_directory)
+        return self.global_matches(rel_path, is_directory) or self.pair_matches(rel_path, is_directory)
 
     @staticmethod
-    def _matches(spec, rel_path, is_directory):
-        path = rel_path.replace("\\", "/").strip("/")
-        if os.name == "nt":
-            path = path.lower()
+    def _matches(spec, directory_matches, rel_path, is_directory):
+        if not spec.patterns:
+            return False
+        path = relative_path_key(rel_path).strip("/")
         # A pruned directory cannot be re-included through a child exception.
         parts = path.split("/")
         for index in range(1, len(parts)):
-            if spec.match_file("/".join(parts[:index]) + "/"):
+            if directory_matches("/".join(parts[:index]) + "/"):
                 return True
-        return spec.match_file(path + ("/" if is_directory else ""))
+        return directory_matches(path + "/") if is_directory else spec.match_file(path)
 
 
 def path_pair_key(source, target, target_is_file=False):
@@ -110,9 +127,6 @@ def append_ignore_path(path, rel_path, is_directory=False, *, pair=None):
     rule = "/" + escaped + ("/" if is_directory else "")
     path = Path(path)
     text = path.read_text(encoding="utf-8-sig") if path.exists() else DEFAULT_IGNORE_TEXT
-    # Validate existing scope headers before modifying the user's rules.
-    if path.exists():
-        IgnoreRules.load(path)
     if pair is None:
         header = "# @global"
     else:
@@ -122,22 +136,29 @@ def append_ignore_path(path, rel_path, is_directory=False, *, pair=None):
             {"source": source, "target": target, "target_is_file": target_is_file}, ensure_ascii=False
         )
     # Append even if an earlier identical rule exists: a later ! rule may undo it.
-    path.write_text(text + ("" if text.endswith("\n") else "\n") + header + "\n" + rule + "\n", encoding="utf-8")
+    text += ("" if text.endswith("\n") else "\n") + header + "\n" + rule + "\n"
+    rules = IgnoreRules.from_text(text)
+    write_text_atomic(path, text)
+    return rules
 
 
-def apply_ignore_rules(differences, rules):
+def apply_ignore_rules(differences, rules, cancel_event=None):
     """Protect ignored descendants before a mirror directory deletion."""
     ignored = {}
     for item in differences:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if item[0] in ("IGNORED", "IGNORED_DIR"):
             ignored.setdefault((item[4], item[5]), {})[
-                item[1].replace("\\", "/")
+                relative_path_key(item[1])
             ] = item[0] == "IGNORED_DIR"
     result = {}
     protected = {}
     for item in differences:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         status, rel_path = item[:2]
-        normalized = rel_path.replace("\\", "/")
+        normalized = relative_path_key(rel_path)
         pair = (item[4], item[5])
         pair_rules = rules.for_pair(*pair, item[7] if len(item) >= 8 else False)
         ignored_paths = ignored.get(pair, {})
@@ -148,12 +169,12 @@ def apply_ignore_rules(differences, rules):
             parent = parent.rpartition("/")[0]
         is_directory = status in ("EXTRA_DIR", "IGNORED_DIR", "PRESERVED_DIR")
         global_ignored = pair_rules.global_matches(rel_path, is_directory)
-        if global_ignored or covered or pair_rules.matches(rel_path, is_directory):
+        if global_ignored or covered or pair_rules.pair_matches(rel_path, is_directory):
             status = "IGNORED_DIR" if is_directory else "IGNORED"
             item = (status, *item[1:])
         if status in ("IGNORED", "IGNORED_DIR", "PRESERVED_DIR", "READ_ONLY"):
             ancestors = protected.setdefault((item[4], item[5]), set())
-            parent = rel_path.replace("\\", "/").rpartition("/")[0]
+            parent = normalized.rpartition("/")[0]
             while parent:
                 ancestors.add(parent)
                 parent = parent.rpartition("/")[0]
@@ -162,7 +183,7 @@ def apply_ignore_rules(differences, rules):
     return [
         ("PRESERVED_DIR", *item[1:])
         if item[0] == "EXTRA_DIR"
-        and item[1].replace("\\", "/") in protected.get((item[4], item[5]), ())
+        and relative_path_key(item[1]) in protected.get((item[4], item[5]), ())
         else item
         for item in result.values()
     ]

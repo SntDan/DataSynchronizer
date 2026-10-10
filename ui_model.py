@@ -1,5 +1,6 @@
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
+from ignore_rules import relative_path_key
 
 
 COLOR_GREEN = QColor("green")
@@ -110,11 +111,12 @@ class TreeNode:
         node = self
         last_index = len(path_parts) - 1
         for index, part in enumerate(path_parts):
-            child = node.children_dict.get(part)
+            key = relative_path_key(part)
+            child = node.children_dict.get(key)
             if child is None:
                 child = TreeNode(part, node)
                 node.children.append(child)
-                node.children_dict[part] = child
+                node.children_dict[key] = child
                 node._cached_visible = None
             if index == last_index:
                 child.status = status
@@ -147,7 +149,15 @@ class DiffTreeModel(QAbstractItemModel):
     def set_is_mirror_mode(self, is_mirror):
         if self.is_mirror_mode != is_mirror:
             self.is_mirror_mode = is_mirror
-            self.layoutChanged.emit()
+            pending = [self.rootItem]
+            while pending:
+                parent = pending.pop()
+                children = parent.visible_children
+                if children:
+                    first = self.createIndex(0, 0, children[0])
+                    last = self.createIndex(len(children) - 1, 0, children[-1])
+                    self.dataChanged.emit(first, last, [Qt.ForegroundRole])
+                    pending.extend(child for child in children if child.children)
 
     def add_batch(self, diffs):
         self.beginResetModel()
@@ -168,19 +178,19 @@ class DiffTreeModel(QAbstractItemModel):
         self.endResetModel()
 
     def update_differences(self, diffs):
-        """Update scan-result metadata without moving rows or replacing nodes."""
+        """Update results while preserving indexes and expansion of retained nodes."""
         retained = set()
         for item in diffs:
             pair_index = item[6] if len(item) >= 7 else None
             parts = item[1].replace("\\", "/").split("/")
-            retained.update((pair_index, "/".join(parts[:end])) for end in range(len(parts) + 1))
+            retained.update((pair_index, relative_path_key("/".join(parts[:end]))) for end in range(len(parts) + 1))
 
         def prune(parent):
-            for child in list(parent.children):
-                if (child.pair_index, child.rel_path) not in retained:
-                    self._remove_node(child)
-                else:
-                    prune(child)
+            removed = {child for child in parent.children if (child.pair_index, relative_path_key(child.rel_path)) not in retained}
+            if removed:
+                self._update_children(parent, removed)
+            for child in parent.children:
+                prune(child)
 
         prune(self.rootItem)
         changed_parents = set()
@@ -192,7 +202,7 @@ class DiffTreeModel(QAbstractItemModel):
                 parts.insert(0, f"[{pair_index + 1}] {source_dir} -> {target_dir}")
             node = self.rootItem
             for part in parts:
-                node = node.children_dict.get(part)
+                node = node.children_dict.get(relative_path_key(part))
                 if node is None:
                     break
             if node is None:
@@ -210,26 +220,41 @@ class DiffTreeModel(QAbstractItemModel):
                 last = self.createIndex(len(children) - 1, 0, children[-1])
                 self.dataChanged.emit(first, last, [Qt.DisplayRole, Qt.ForegroundRole])
 
-    def _remove_node(self, node):
-        """Remove a hidden result while preserving indexes for remaining rows."""
-        parent = node.parent
+    def _update_children(self, parent, removed=()):
+        """Reconcile each folder once, including pagination and persistent indexes."""
         current = list(parent.visible_children)
-        parent.children.remove(node)
-        del parent.children_dict[node.name]
+        if removed:
+            parent.children = [child for child in parent.children if child not in removed]
+            for child in removed:
+                del parent.children_dict[relative_path_key(child.name)]
         parent._cached_visible = None
         desired = list(parent.visible_children)
         parent._cached_visible = current
         parent_index = QModelIndex() if parent is self.rootItem else self.createIndex(parent.row(), 0, parent)
-        for row in range(len(current) - 1, -1, -1):
-            if current[row] not in desired:
-                self.beginRemoveRows(parent_index, row, row)
-                current.pop(row)
-                self.endRemoveRows()
-        for row, child in enumerate(desired):
-            if child not in current:
-                self.beginInsertRows(parent_index, row, row)
-                current.insert(row, child)
-                self.endInsertRows()
+        desired_set = set(desired)
+        row = len(current) - 1
+        while row >= 0:
+            if current[row] in desired_set:
+                row -= 1
+                continue
+            end = row
+            while row >= 0 and current[row] not in desired_set:
+                row -= 1
+            self.beginRemoveRows(parent_index, row + 1, end)
+            del current[row + 1:end + 1]
+            self.endRemoveRows()
+        current_set = set(current)
+        row = 0
+        while row < len(desired):
+            if desired[row] in current_set:
+                row += 1
+                continue
+            start = row
+            while row < len(desired) and desired[row] not in current_set:
+                row += 1
+            self.beginInsertRows(parent_index, start, row - 1)
+            current[start:start] = desired[start:row]
+            self.endInsertRows()
 
     def clear(self):
         self.beginResetModel()
@@ -306,11 +331,9 @@ class DiffTreeModel(QAbstractItemModel):
             return False
 
         parent_item = item.parent
-        self.layoutAboutToBeChanged.emit()
         if item.is_ellipsis_sync:
             parent_item.is_truncated_sync = False
         else:
             parent_item.is_truncated_extra = False
-        parent_item._cached_visible = None
-        self.layoutChanged.emit()
+        self._update_children(parent_item)
         return True
