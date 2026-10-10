@@ -10,13 +10,12 @@ from contextlib import closing
 import xxhash
 from PySide6.QtCore import QObject, Signal
 
-from core_scanner import canonical_directory
+from core_scanner import canonical_directory, is_read_only
 from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules, apply_ignore_rules
 
 
 class CopyManager(QObject):
     overall_progress = Signal(int, int)
-    current_file_progress = Signal(str, int)
     copy_finished = Signal()
 
     def __init__(self, db_path="sync_snapshot.db", max_workers=4):
@@ -193,6 +192,8 @@ class CopyManager(QObject):
                 rel_path, status == "EXTRA_DIR"
             ):
                 return None
+            if os.path.isfile(target_path) and is_read_only(os.stat(target_path)):
+                raise PermissionError(f"Target is read-only: {target_path}")
             if status in ("EXTRA", "EXTRA_DIR"):
                 if not self.mirror_mode:
                     return None
@@ -209,11 +210,7 @@ class CopyManager(QObject):
                     )
 
                 if os.path.exists(target_path):
-                    try:
-                        os.remove(target_path)
-                    except OSError:
-                        os.chmod(target_path, stat.S_IWRITE)
-                        os.remove(target_path)
+                    os.remove(target_path)
                 return (
                     "delete",
                     normalized_rel,
@@ -222,49 +219,30 @@ class CopyManager(QObject):
                 )
 
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            copied_bytes = 0
+            resume_offset = 0
             mode = "wb"
 
             if os.path.exists(target_path):
                 existing_size = os.path.getsize(target_path)
                 if existing_size < size:
-                    copied_bytes = self._resume_offset(source_path, target_path)
-                    if copied_bytes:
+                    resume_offset = self._resume_offset(source_path, target_path)
+                    if resume_offset:
                         mode = "ab"
-                elif existing_size == size and status != "MODIFIED":
-                    return (
-                        "upsert",
-                        normalized_rel,
-                        source_dir,
-                        target_dir,
-                        size,
-                        os.path.getmtime(source_path),
-                        self._get_file_hash(source_path),
-                    )
 
             if self._cancel_event.is_set():
                 return None
             hasher = xxhash.xxh64()
-            inline_hash = copied_bytes == 0
-            last_percent = -1
+            inline_hash = resume_offset == 0
             with open(source_path, "rb") as src, open(
                 target_path, mode
             ) as dst:
-                src.seek(copied_bytes)
+                src.seek(resume_offset)
                 while chunk := src.read(4 * 1024 * 1024):
                     if self._cancel_event.is_set():
                         return None
                     if inline_hash:
                         hasher.update(chunk)
                     dst.write(chunk)
-                    copied_bytes += len(chunk)
-                    if size:
-                        percent = copied_bytes * 100 // size
-                        if percent != last_percent:
-                            self.current_file_progress.emit(
-                                rel_path, percent
-                            )
-                            last_percent = percent
 
             shutil.copystat(source_path, target_path)
             file_hash = (
@@ -314,11 +292,9 @@ class CopyManager(QObject):
             if is_directory:
                 self._remove_extra_directory(entry.path, child_rel)
             else:
-                try:
-                    os.remove(entry.path)
-                except PermissionError:
-                    os.chmod(entry.path, stat.S_IWRITE)
-                    os.remove(entry.path)
+                if is_read_only(entry.stat(follow_symlinks=False)):
+                    continue
+                os.remove(entry.path)
         if self._cancel_event.is_set():
             return False
         try:

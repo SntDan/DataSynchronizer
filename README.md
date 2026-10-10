@@ -17,7 +17,9 @@ A small PySide6 desktop tool for one-way file synchronization. It compares sourc
 - Copy new and modified files from source to target
 - Optional mirror mode to remove extra target files and folders
 - Resume interrupted copies
-- Use a local SQLite snapshot database for faster later scans
+- Toggle between xxHash64 content verification and fast metadata scanning
+- Keep synchronization history in a local SQLite snapshot database
+- Preserve read-only target files and show pending differences as `[READ_ONLY]`
 - Treat `/`, `\`, and Windows path casing as the same snapshot identity
 - Switch between English and Simplified Chinese
 - Persist gitignore-style rules in `.syncignore`; show ignored items in a distinct gray
@@ -46,7 +48,7 @@ python main.py
 4. Click **1. Scan** to compare active pairs.
 5. Click **2. Sync** to copy confirmed changes.
 
-UI changes do not write back to `config.json`.
+Temporary path changes do not write back to `config.json`. **Settings**, beside **Add Grp**, saves the content verification and mirror options to that file.
 
 ## Configuration
 
@@ -70,7 +72,9 @@ UI changes do not write back to `config.json`.
     }
   ],
   "copy_workers": 4,
-  "default_language": "zh_CN"
+  "default_language": "zh_CN",
+  "verify_contents": false,
+  "mirror_mode": false
 }
 ```
 
@@ -78,8 +82,16 @@ UI changes do not write back to `config.json`.
 - `target_type`: optional `file` or `directory`; useful when a configured target file does not exist yet
 - `copy_workers`: maximum concurrent copy workers
 - `default_language`: `en_US` or `zh_CN`
+- `verify_contents`: enable xxHash64 content verification; defaults to `false`
+- `mirror_mode`: remove extra target files and folders; defaults to `false`
 
 ## Notes
+
+With **Verify contents (xxHash)** enabled in **Settings**, scanning compares the current source and target: a missing target is new, a different size is modified, and equal-sized files are read completely on both sides and compared with xxHash64. Timestamps and historical snapshots do not decide whether contents match. Identical contents with different timestamps are skipped; equal sizes and timestamps cannot hide different contents. Full verification reads both sides on every scan, so large collections and network drives can take longer. xxHash64 is a fast non-cryptographic hash with a very small, nonzero collision risk. Read errors or changes detected while hashing stop the scan and prevent synchronizing partial results.
+
+Content verification is off by default, using the original fast scan based on sizes, timestamps and saved snapshots without reading file contents. This mode can miss equal-sized content changes. The Settings dialog also contains **Remove extras**; both options are saved to `config.json` and restored at startup. Settings cannot be changed while scanning or synchronizing. Long status messages are truncated on the right with an ellipsis instead of widening the window; hover over the status to read the full text.
+
+Read-only target files with pending changes or mirror deletions appear as `[READ_ONLY]` and are preserved. Their read-only attribute is never cleared to force a file overwrite or deletion. A target that becomes read-only after scanning produces a synchronization error instead.
 
 `.syncignore` lives beside `main.py` (or the packaged executable) and is created with default system-file exclusions if missing. Rules apply to paths relative to **each** source/target pair, on both sides. It supports gitignore syntax: comments (`#`), wildcards (`*.tmp`, `**/logs/`), root anchoring (`/report.txt`), directories (`cache/`), and exceptions (`!keep.tmp`). Windows matching is case insensitive. To include a file inside an ignored directory, first unignore the directory itself. For a single-file pair, rules match the original source filename, even if the target is renamed.
 
@@ -138,7 +150,9 @@ python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 - 单向同步：源目录复制到目标目录
 - 可选镜像模式：删除目标端多余文件和文件夹
 - 支持中断后续传
-- 使用本地 SQLite 快照数据库加快后续扫描
+- 可切换 xxHash64 内容校验与按文件属性快速扫描
+- 使用本地 SQLite 快照数据库记录同步历史
+- 保留只读目标文件，将待处理差异标记为 `[READ_ONLY]`
 - 正反斜杠和 Windows 路径大小写会按同一组快照识别
 - 支持英文和简体中文界面
 - 使用 `.syncignore` 持久保存类似 gitignore 的规则，忽略项用独立的灰色显示
@@ -167,7 +181,7 @@ python main.py
 4. 点击「1. 扫描差异」查看结果。
 5. 点击「2. 开始同步」确认后执行复制。
 
-界面里的临时调整不会写回 `config.json`。
+路径组的临时调整不会写回 `config.json`。「添加组」左侧的「设置」按钮可打开设置弹窗，保存内容校验和删除多余文件两个选项。
 
 ## 配置文件
 
@@ -191,7 +205,9 @@ python main.py
     }
   ],
   "copy_workers": 4,
-  "default_language": "zh_CN"
+  "default_language": "zh_CN",
+  "verify_contents": false,
+  "mirror_mode": false
 }
 ```
 
@@ -199,8 +215,16 @@ python main.py
 - `target_type`：可选值为 `file` 或 `directory`；目标文件尚不存在时可用它明确类型
 - `copy_workers`：最大并发复制线程数
 - `default_language`：`en_US` 或 `zh_CN`
+- `verify_contents`：启用 xxHash64 内容校验，默认 `false`
+- `mirror_mode`：删除目标端多余文件和文件夹，默认 `false`
 
 ## 说明
+
+在设置中开启「内容校验（xxHash）」后，扫描比较当前源文件和目标文件，目标不存在时标记为新增，大小不同时标记为修改；大小相同时完整读取两端文件，用 xxHash64 比较内容。时间戳和历史快照不决定内容是否一致。内容相同但时间不同的文件会跳过；大小和时间均相同也不会掩盖内容差异。每次扫描都会读取两端进行完整校验，大量文件和网络盘可能需要更长时间。xxHash64 是快速的非加密哈希，碰撞风险很低但不为零。读取失败或校验过程中检测到文件变化时，会中止扫描并禁止同步残缺结果。
+
+内容校验默认关闭，采用原来按大小、时间和已有快照进行的快速扫描，不读取文件内容，可能漏掉同大小的内容变化。设置弹窗还包含「删除多余文件」，两个选项会保存到 `config.json`，下次启动时恢复。扫描和同步期间不可更改设置。底部状态过长时在右侧显示省略号，不会撑宽窗口；悬停可查看完整文字。
+
+只读目标文件如果需要覆盖或在镜像模式中删除，会显示为 `[READ_ONLY]` 并保留。程序不会清除文件的只读属性来强制覆盖或删除；扫描之后目标才变成只读时，会报告同步错误。
 
 `.syncignore` 位于 `main.py`（打包后为可执行文件）的同级目录；文件不存在时，会自动创建并写入默认系统文件忽略规则。规则相对于**每组**源路径和目标路径的根目录，对两端均生效。支持 gitignore 风格的注释（`#`）、通配符（`*.tmp`、`**/logs/`）、根路径匹配（`/report.txt`）、目录规则（`cache/`）和例外（`!keep.tmp`）。Windows 下匹配不区分大小写。若要保留被忽略目录内某个文件参与同步，需先取消对该目录本身的忽略。单文件组按源文件的原始文件名匹配，目标重命名不影响规则。
 

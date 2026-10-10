@@ -257,9 +257,9 @@ class DiffTreeModel(QAbstractItemModel):
                 return COLOR_GRAY
             if item.status == "NEW":
                 return COLOR_GREEN
-            if item.status == "MODIFIED":
+            if item.status in ("MODIFIED", "READ_ONLY"):
                 return COLOR_ORANGE
-            if item.status in ("EXTRA", "EXTRA_DIR", "CONFLICT"):
+            if item.status in ("EXTRA", "EXTRA_DIR"):
                 return COLOR_RED if self.is_mirror_mode else COLOR_GRAY
         return None
 

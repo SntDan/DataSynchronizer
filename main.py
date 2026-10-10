@@ -3,14 +3,17 @@ import os
 import sys
 import threading
 import subprocess
+import tempfile
 from pathlib import Path
 from itertools import zip_longest
 
-from PySide6.QtCore import QEvent, QRect, QThread, QTimer, Qt, Signal, QUrl, qWarning
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, QRect, QSize, QThread, QTimer, Qt, Signal, QUrl, qWarning
+from PySide6.QtGui import QDesktopServices, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
     QProxyStyle,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStyle,
     QStyleOption,
     QToolButton,
@@ -57,8 +61,6 @@ UI_TEXTS = {
     "zh_CN": {
         "title": "DataSynchronizer",
         "group_label": "第{}组",
-        "source_short": "源: ",
-        "target_short": "目标: ",
         "source_placeholder": "源文件或目录",
         "target_placeholder": "目标文件或目录",
         "change_btn": "选择",
@@ -67,12 +69,13 @@ UI_TEXTS = {
         "choose_target_file": "选择或新建文件",
         "add_group_btn": "添加组",
         "remove_group_btn": "删除组",
-        "src_btn": "添加",
-        "clear_btn": "清空",
-        "src_label": "源目录:",
-        "dst_btn": "添加",
-        "dst_label": "目标目录:",
         "mirror_chk": "删除多余文件",
+        "settings_btn": "设置",
+        "settings_save": "保存",
+        "settings_cancel": "取消",
+        "settings_error": "无法保存设置：\n{}",
+        "verify_chk": "内容校验（xxHash）",
+        "verify_tip": "开启：读取两端文件并比较内容。关闭：按大小、时间和快照快速扫描。",
         "scan_btn": "1. 扫描差异",
         "sync_btn": "2. 开始同步",
         "stop_btn": "停止",
@@ -81,7 +84,9 @@ UI_TEXTS = {
         "scanning": "正在扫描第 {} / {} 组",
         "stopping": "正在停止扫描……",
         "scan_stopped": "扫描已停止",
-        "scan_done": "扫描完成  新增: {}，修改: {}，多余: {}，忽略: {}",
+        "scan_done": "扫描完成  新增: {}，修改: {}，多余: {}，忽略: {}，只读: {}",
+        "hash_check": "正在校验第 {} / {} 组：{}",
+        "sync_read_only": "\n只读目标: {} 项，将保留，不覆盖或删除。",
         "scan_prog": "正在扫描第 {} / {} 组，已检查 {} 个文件",
         "start_sync": "准备开始同步",
         "sync_prog": "正在同步: {} / {}",
@@ -102,7 +107,6 @@ UI_TEXTS = {
         ),
         "warn_title": "警告",
         "warn_empty": "请至少设置一组源路径和目标路径。",
-        "warn_count": "源目录和目标目录数量必须一致，并按行号一一对应。",
         "warn_source": "源文件或目录不存在：\n{}",
         "warn_target": "无法创建目标目录：\n{}",
         "warn_dir_to_file": "第 {} 组不能把源目录同步到单个目标文件。",
@@ -128,8 +132,6 @@ UI_TEXTS = {
     "en_US": {
         "title": "DataSynchronizer",
         "group_label": "Group {}",
-        "source_short": "Src:",
-        "target_short": "Dst:",
         "source_placeholder": "Source file or directory",
         "target_placeholder": "Target file or directory",
         "change_btn": "Choose",
@@ -138,12 +140,13 @@ UI_TEXTS = {
         "choose_target_file": "Select or Create File",
         "add_group_btn": "Add Grp",
         "remove_group_btn": "Del Grp",
-        "src_btn": "Add",
-        "clear_btn": "Clear",
-        "src_label": "Sources:",
-        "dst_btn": "Add",
-        "dst_label": "Targets:",
         "mirror_chk": "Remove extras",
+        "settings_btn": "Settings",
+        "settings_save": "Save",
+        "settings_cancel": "Cancel",
+        "settings_error": "Could not save settings:\n{}",
+        "verify_chk": "Verify contents (xxHash)",
+        "verify_tip": "On: read and compare both files. Off: scan quickly using sizes, timestamps and snapshots.",
         "scan_btn": "1. Scan",
         "sync_btn": "2. Sync",
         "stop_btn": "Stop",
@@ -152,7 +155,9 @@ UI_TEXTS = {
         "scanning": "Scanning pair {} / {}",
         "stopping": "Stopping scan…",
         "scan_stopped": "Scan stopped",
-        "scan_done": "Scan complete  New: {}, Modified: {}, Extra: {}, Ignored: {}",
+        "scan_done": "Scan complete  New: {}, Modified: {}, Extra: {}, Ignored: {}, Read-only: {}",
+        "hash_check": "Verifying pair {} / {}: {}",
+        "sync_read_only": "\nRead-only targets: {}; preserved without overwriting or deleting.",
         "scan_prog": "Scanning pair {} / {}, checked {} files",
         "start_sync": "Preparing to synchronize",
         "sync_prog": "Synchronizing: {} / {}",
@@ -173,9 +178,6 @@ UI_TEXTS = {
         ),
         "warn_title": "Warning",
         "warn_empty": "Please specify at least one source and target path pair.",
-        "warn_count": (
-            "Source and target counts must match; lines are paired by number."
-        ),
         "warn_source": "Source file or directory does not exist:\n{}",
         "warn_target": "Could not create target directory:\n{}",
         "warn_dir_to_file": (
@@ -210,6 +212,8 @@ def load_config():
         "directory_pairs": [],
         "copy_workers": 4,
         "default_language": DEFAULT_LANGUAGE,
+        "verify_contents": False,
+        "mirror_mode": False,
     }
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
@@ -255,23 +259,69 @@ def load_config():
             "directory_pairs": pairs,
             "copy_workers": max(1, int(workers)),
             "default_language": default_language,
+            "verify_contents": data.get("verify_contents") is True,
+            "mirror_mode": data.get("mirror_mode") is True,
         }
         return config
     except FileNotFoundError:
-        _write_config(default_config)
+        try:
+            _write_config(default_config)
+        except OSError:
+            pass
         return default_config
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError):
         return default_config
 
 
 def _write_config(data):
+    temporary_path = None
     try:
-        CONFIG_PATH.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=CONFIG_PATH.parent,
+            prefix=".config-", suffix=".tmp", delete=False,
+        ) as file_obj:
+            temporary_path = Path(file_obj.name)
+            json.dump(data, file_obj, ensure_ascii=False, indent=2)
+            file_obj.write("\n")
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle(parent.get_text("settings_btn"))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(16)
+        self.mirror_checkbox = QCheckBox(parent.get_text("mirror_chk"))
+        self.mirror_checkbox.setChecked(parent.mirror_mode)
+        self.verify_checkbox = QCheckBox(parent.get_text("verify_chk"))
+        self.verify_checkbox.setToolTip(parent.get_text("verify_tip"))
+        self.verify_checkbox.setChecked(parent.verify_contents)
+        layout.addWidget(self.mirror_checkbox)
+        layout.addWidget(self.verify_checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText(parent.get_text("settings_save"))
+        buttons.button(QDialogButtonBox.Cancel).setText(parent.get_text("settings_cancel"))
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def save(self):
+        try:
+            self.parent().save_settings(
+                self.verify_checkbox.isChecked(), self.mirror_checkbox.isChecked()
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self, self.parent().get_text("warn_title"),
+                self.parent().get_text("settings_error", exc),
+            )
+            return
+        self.accept()
 
 
 class PathButtonStyle(QProxyStyle):
@@ -297,15 +347,46 @@ class PathButtonStyle(QProxyStyle):
         super().drawPrimitive(element, option, painter, widget)
 
 
+class ElidedLabel(QLabel):
+    """Keep full status text without letting it determine the window width."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def sizeHint(self):
+        return QSize(0, self.fontMetrics().height())
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def elided_text(self):
+        return self.fontMetrics().elidedText(
+            self.text().replace("\n", " "), Qt.ElideRight, self.contentsRect().width()
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        self.style().drawItemText(
+            painter, self.contentsRect(), int(self.alignment() | Qt.TextSingleLine),
+            self.palette(), self.isEnabled(), self.elided_text(), QPalette.WindowText,
+        )
+
+
 class SyncWorker(QThread):
     pair_started = Signal(int, int)
     failed = Signal(str)
 
-    def __init__(self, scanner, directory_pairs, deep_hash=False):
+    def __init__(self, scanner, directory_pairs, verify_contents=False):
         super().__init__()
         self.scanner = scanner
         self.directory_pairs = directory_pairs
-        self.deep_hash = deep_hash
+        self.verify_contents = verify_contents
         self.cancel_event = threading.Event()
         self.was_cancelled = False
 
@@ -324,10 +405,10 @@ class SyncWorker(QThread):
                 self.scanner.scan_and_compare(
                     source_dir,
                     target_dir,
-                    self.deep_hash,
                     pair_index=index,
                     cancel_event=self.cancel_event,
                     target_is_file=target_is_file,
+                    verify_contents=self.verify_contents,
                 )
                 if self.cancel_event.is_set():
                     self.was_cancelled = True
@@ -341,6 +422,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._frame_dpr = self.devicePixelRatioF()
         self.config = load_config()
+        self.verify_contents = self.config.get("verify_contents", False)
+        self.mirror_mode = self.config.get("mirror_mode", False)
         self.current_lang = self.config.get(
             "default_language", DEFAULT_LANGUAGE
         )
@@ -381,15 +464,19 @@ class MainWindow(QMainWindow):
         self.add_group_btn.clicked.connect(
             lambda: self.add_directory_group()
         )
+        self.settings_btn = QPushButton()
+        self.settings_btn.setFixedSize(91, 30)
+        self.settings_btn.clicked.connect(self.show_settings)
         self.brand_label = QLabel(" DataSynchronizer")
         self.brand_label.setStyleSheet(
             "QLabel { font-size: 15pt; font-weight: 700; }"
         )
         top_toolbar = QHBoxLayout()
-        top_toolbar.setContentsMargins(0, 0, 8, 0)
-        top_toolbar.setSpacing(8)
+        top_toolbar.setContentsMargins(0, 0, 9, 0)
+        top_toolbar.setSpacing(4)
         top_toolbar.addWidget(self.brand_label)
         top_toolbar.addStretch()
+        top_toolbar.addWidget(self.settings_btn)
         top_toolbar.addWidget(self.add_group_btn)
 
         self.groups_container = QWidget()
@@ -409,15 +496,12 @@ class MainWindow(QMainWindow):
         self.list_view.setUniformRowHeights(True)
         self.list_view.setIndentation(18)
         self.list_model = DiffTreeModel()
+        self.list_model.set_is_mirror_mode(self.mirror_mode)
         self.list_view.setModel(self.list_model)
         self.list_view.clicked.connect(self.on_node_clicked)
         self.list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self.show_file_context_menu)
 
-        self.mirror_checkbox = QCheckBox()
-        self.mirror_checkbox.stateChanged.connect(
-            self.on_mirror_checked_changed
-        )
         self.lang_btn = QPushButton()
         self.lang_btn.setFixedSize(96, 30)
         self.lang_btn.clicked.connect(self.toggle_language)
@@ -452,9 +536,6 @@ class MainWindow(QMainWindow):
         operation_layout = QGridLayout()
         operation_layout.setContentsMargins(3, 0, 9, 0)
         operation_layout.setHorizontalSpacing(8)
-        operation_layout.addWidget(
-            self.mirror_checkbox, 0, 0, Qt.AlignLeft | Qt.AlignVCenter
-        )
         operation_layout.addLayout(action_layout, 0, 1, Qt.AlignCenter)
         operation_layout.addLayout(
             right_action_layout, 0, 2, Qt.AlignRight | Qt.AlignVCenter
@@ -464,7 +545,7 @@ class MainWindow(QMainWindow):
         operation_layout.setColumnStretch(0, 1)
         operation_layout.setColumnStretch(2, 1)
 
-        self.status_label = QLabel()
+        self.status_label = ElidedLabel()
         self.status_label.setStyleSheet(
             "QLabel { font-size: 10pt; font-weight: normal; }"
         )
@@ -707,6 +788,7 @@ class MainWindow(QMainWindow):
                 self, self.get_text("warn_title"), self.get_text("ignore_error", exc)
             )
         self.scanner.progress_updated.connect(self.on_scan_progress)
+        self.scanner.file_check_started.connect(self.on_scan_file_check)
         self.scanner.diff_batch_found.connect(self.on_diff_batch)
 
         self.copy_mgr = CopyManager(
@@ -714,9 +796,6 @@ class MainWindow(QMainWindow):
         )
         self.copy_mgr.overall_progress.connect(
             self.on_copy_overall_progress
-        )
-        self.copy_mgr.current_file_progress.connect(
-            self.on_copy_file_progress
         )
         self.copy_mgr.copy_finished.connect(self.on_copy_finished)
 
@@ -737,7 +816,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.get_text("title"))
         self.add_group_btn.setText(self.get_text("add_group_btn"))
         self._update_group_row_texts()
-        self.mirror_checkbox.setText(self.get_text("mirror_chk"))
+        self.settings_btn.setText(self.get_text("settings_btn"))
         self.scan_btn.setText(self.get_text("scan_btn"))
         self.sync_btn.setText(self.get_text("sync_btn"))
         self.stop_btn.setText(self.get_text("stop_btn"))
@@ -759,6 +838,29 @@ class MainWindow(QMainWindow):
             "en_US" if self.current_lang == "zh_CN" else "zh_CN"
         )
         self.update_ui_texts()
+
+    def show_settings(self):
+        if self._task_running() or self._closing:
+            return
+        dialog = SettingsDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def save_settings(self, verify_contents, mirror_mode):
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
+                data = json.load(file_obj)
+        except FileNotFoundError:
+            data = dict(self.config)
+        if not isinstance(data, dict):
+            raise ValueError("config.json must be an object")
+        data.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        _write_config(data)
+        self.config.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        self.verify_contents = verify_contents
+        self.mirror_mode = mirror_mode
+        self.list_model.set_is_mirror_mode(mirror_mode)
+        self._update_sync_enabled()
 
     def _validated_pairs(self):
         if not self.path_rows:
@@ -873,11 +975,12 @@ class MainWindow(QMainWindow):
         self.set_status("scanning", 1, len(pairs))
         self.progress_bar.setRange(0, 0)
         self.scan_btn.setEnabled(False)
+        self.settings_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.stop_btn.setVisible(True)
 
-        self.scan_worker = SyncWorker(self.scanner, pairs, deep_hash=False)
+        self.scan_worker = SyncWorker(self.scanner, pairs, self.verify_contents)
         self.scan_worker.pair_started.connect(self.on_pair_started)
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_worker.finished.connect(self.on_scan_finished)
@@ -901,7 +1004,7 @@ class MainWindow(QMainWindow):
     def on_diff_batch(self, differences):
         self.diff_data_full.extend(differences)
 
-    def on_scan_progress(self, count, total):
+    def on_scan_progress(self, count):
         if self.scan_worker.cancel_event.is_set():
             return
         self.set_status(
@@ -914,11 +1017,17 @@ class MainWindow(QMainWindow):
     def on_scan_failed(self, message):
         self.scan_error = message
 
+    def on_scan_file_check(self, rel_path):
+        if self._closing or self.scan_worker.cancel_event.is_set():
+            return
+        self.set_status("hash_check", self.current_scan_pair, self.total_scan_pairs, rel_path)
+
     def on_scan_finished(self):
         if self._closing:
             return
         self.progress_bar.setRange(0, 100)
         self.scan_btn.setEnabled(True)
+        self.settings_btn.setEnabled(True)
         self.stop_btn.setVisible(False)
         if self.scan_worker.was_cancelled:
             self.diff_data_full.clear()
@@ -952,6 +1061,7 @@ class MainWindow(QMainWindow):
             counts["MODIFIED"],
             counts["EXTRA"] + counts["EXTRA_DIR"],
             counts["IGNORED"] + counts["IGNORED_DIR"],
+            counts["READ_ONLY"],
         )
         self._update_sync_enabled()
         self.expand_smartly()
@@ -964,6 +1074,7 @@ class MainWindow(QMainWindow):
             "EXTRA_DIR": 0,
             "IGNORED": 0,
             "IGNORED_DIR": 0,
+            "READ_ONLY": 0,
         }
         for item in self.diff_data_full:
             status = item[0]
@@ -971,20 +1082,13 @@ class MainWindow(QMainWindow):
                 counts[status] += 1
         return counts
 
-    def on_mirror_checked_changed(self, state):
-        self.list_model.set_is_mirror_mode(
-            self.mirror_checkbox.isChecked()
-        )
-        if hasattr(self, "copy_mgr") and not self._task_running():
-            self._update_sync_enabled()
-
     def _task_running(self):
         worker = getattr(self, "scan_worker", None)
         return (worker is not None and worker.isRunning()) or self.copy_mgr.is_syncing
 
     def _update_sync_enabled(self):
         statuses = {"NEW", "MODIFIED"}
-        if self.mirror_checkbox.isChecked():
+        if self.mirror_mode:
             statuses.update(("EXTRA", "EXTRA_DIR"))
         self.sync_btn.setEnabled(any(item[0] in statuses for item in self.diff_data_full))
 
@@ -1065,7 +1169,11 @@ class MainWindow(QMainWindow):
         else:
             self.list_model.update_differences(self.diff_data_full)
         counts = self._difference_counts()
-        self.set_status("scan_done", counts["NEW"], counts["MODIFIED"], counts["EXTRA"] + counts["EXTRA_DIR"], counts["IGNORED"] + counts["IGNORED_DIR"])
+        self.set_status(
+            "scan_done", counts["NEW"], counts["MODIFIED"],
+            counts["EXTRA"] + counts["EXTRA_DIR"],
+            counts["IGNORED"] + counts["IGNORED_DIR"], counts["READ_ONLY"],
+        )
         self._update_sync_enabled()
         if initial_population:
             self.expand_smartly()
@@ -1095,7 +1203,7 @@ class MainWindow(QMainWindow):
         if not self.sync_btn.isEnabled():
             return
         counts = self._difference_counts()
-        is_mirror = self.mirror_checkbox.isChecked()
+        is_mirror = self.mirror_mode
         message = self.get_text(
             "sync_confirm_msg",
             len(self.directory_pairs),
@@ -1113,6 +1221,8 @@ class MainWindow(QMainWindow):
                 "sync_confirm_no_mirror",
                 counts["EXTRA"] + counts["EXTRA_DIR"],
             )
+        if counts["READ_ONLY"]:
+            message += self.get_text("sync_read_only", counts["READ_ONLY"])
 
         reply = QMessageBox.question(
             self,
@@ -1125,6 +1235,7 @@ class MainWindow(QMainWindow):
             return
 
         self.scan_btn.setEnabled(False)
+        self.settings_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
         self.set_status("start_sync")
         self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
@@ -1140,14 +1251,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.set_status("sync_prog", current, total)
 
-    def on_copy_file_progress(self, file_path, percent):
-        pass
-
     def on_copy_finished(self):
         if self._closing:
             return
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.scan_btn.setEnabled(True)
+        self.settings_btn.setEnabled(True)
         self.sync_btn.setEnabled(False)
         if self.copy_mgr.failed_count:
             self.set_status("sync_failed", self.copy_mgr.failed_count)

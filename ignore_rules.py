@@ -85,7 +85,7 @@ def apply_ignore_rules(differences, rules):
         if covered or rules.matches(rel_path, is_directory):
             status = "IGNORED_DIR" if is_directory else "IGNORED"
             item = (status, *item[1:])
-        if status in ("IGNORED", "IGNORED_DIR", "PRESERVED_DIR"):
+        if status in ("IGNORED", "IGNORED_DIR", "PRESERVED_DIR", "READ_ONLY"):
             ancestors = protected.setdefault((item[4], item[5]), set())
             parent = rel_path.replace("\\", "/").rpartition("/")[0]
             while parent:
