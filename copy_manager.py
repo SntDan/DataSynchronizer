@@ -2,6 +2,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import errno
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
@@ -10,6 +11,7 @@ import xxhash
 from PySide6.QtCore import QObject, Signal
 
 from core_scanner import canonical_directory
+from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules, apply_ignore_rules
 
 
 class CopyManager(QObject):
@@ -24,6 +26,8 @@ class CopyManager(QObject):
         self._progress_lock = threading.Lock()
         self._cancel_event = threading.Event()
         self.is_syncing = False
+        self.failed_count = 0
+        self.errors = []
         try:
             with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -31,12 +35,13 @@ class CopyManager(QObject):
         except sqlite3.DatabaseError:
             pass
 
-    @staticmethod
-    def _get_file_hash(filepath):
+    def _get_file_hash(self, filepath):
         hasher = xxhash.xxh64()
         try:
             with open(filepath, "rb") as file_obj:
                 while chunk := file_obj.read(4 * 1024 * 1024):
+                    if self._cancel_event.is_set():
+                        return None
                     hasher.update(chunk)
             return hasher.hexdigest()
         except OSError:
@@ -51,8 +56,18 @@ class CopyManager(QObject):
             parent = parent.rpartition("/")[0]
         return False
 
-    def start_sync(self, diff_results, mirror_mode=False):
+    def start_sync(self, diff_results, mirror_mode=False, ignore_rules=None):
+        if self.is_syncing:
+            return
         self._cancel_event.clear()
+        self.failed_count = 0
+        self.errors = []
+        self.ignore_rules = ignore_rules or IgnoreRules(DEFAULT_IGNORE_TEXT.splitlines())
+        diff_results = apply_ignore_rules(diff_results, self.ignore_rules)
+        statuses = {"NEW", "MODIFIED"}
+        if mirror_mode:
+            statuses.update(("EXTRA", "EXTRA_DIR"))
+        diff_results = [item for item in diff_results if item[0] in statuses]
         extra_dirs_by_pair = {}
         for item in diff_results:
             if item[0] == "EXTRA_DIR":
@@ -123,6 +138,8 @@ class CopyManager(QObject):
 
             if db_operations:
                 self._apply_db_operations(db_operations)
+        except Exception as exc:
+            self._record_error("", exc)
         finally:
             self.is_syncing = False
             self.copy_finished.emit()
@@ -143,13 +160,21 @@ class CopyManager(QObject):
             current = self.copied_count
         self.overall_progress.emit(current, self.total_files)
 
-    @staticmethod
-    def _remove_readonly(func, path, exc_info):
-        try:
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        except OSError:
-            pass
+    def _record_error(self, path, exc):
+        with self._progress_lock:
+            self.failed_count += 1
+            if len(self.errors) < 20:
+                self.errors.append(f"{path}: {exc}" if path else str(exc))
+
+    def _resume_offset(self, source_path, target_path):
+        """Only resume when the target is an exact prefix of the source."""
+        with open(source_path, "rb") as source, open(target_path, "rb") as target:
+            offset = 0
+            while chunk := target.read(4 * 1024 * 1024):
+                if self._cancel_event.is_set() or source.read(len(chunk)) != chunk:
+                    return 0
+                offset += len(chunk)
+            return offset
 
     def _copy_single_file(self, item):
         status, rel_path, source_path, size, source_dir, target_dir, _ = item[:7]
@@ -164,14 +189,18 @@ class CopyManager(QObject):
         try:
             if self._cancel_event.is_set():
                 return None
+            if status not in ("NEW", "MODIFIED", "EXTRA", "EXTRA_DIR") or self.ignore_rules.matches(
+                rel_path, status == "EXTRA_DIR"
+            ):
+                return None
             if status in ("EXTRA", "EXTRA_DIR"):
                 if not self.mirror_mode:
                     return None
                 if status == "EXTRA_DIR":
-                    if os.path.exists(target_path):
-                        shutil.rmtree(
-                            target_path, onerror=self._remove_readonly
-                        )
+                    if os.path.exists(target_path) and not self._remove_extra_directory(
+                        target_path, rel_path
+                    ):
+                        return None
                     return (
                         "delete_tree",
                         normalized_rel,
@@ -199,8 +228,9 @@ class CopyManager(QObject):
             if os.path.exists(target_path):
                 existing_size = os.path.getsize(target_path)
                 if existing_size < size:
-                    copied_bytes = existing_size
-                    mode = "ab"
+                    copied_bytes = self._resume_offset(source_path, target_path)
+                    if copied_bytes:
+                        mode = "ab"
                 elif existing_size == size and status != "MODIFIED":
                     return (
                         "upsert",
@@ -212,6 +242,8 @@ class CopyManager(QObject):
                         self._get_file_hash(source_path),
                     )
 
+            if self._cancel_event.is_set():
+                return None
             hasher = xxhash.xxh64()
             inline_hash = copied_bytes == 0
             last_percent = -1
@@ -250,10 +282,56 @@ class CopyManager(QObject):
                 file_hash,
             )
         except Exception as exc:
-            print(f"Error processing {rel_path}: {exc}")
+            self._record_error(rel_path, exc)
             return None
         finally:
             self._advance_progress()
+
+    def _remove_extra_directory(self, path, rel_path):
+        """Check rules again while deleting, including files added since scan."""
+        if self._cancel_event.is_set() or self.ignore_rules.matches(rel_path, True):
+            return False
+        # Do not descend into Windows junctions or other directory links.
+        path_stat = os.lstat(path)
+        if stat.S_ISLNK(path_stat.st_mode) or (
+            getattr(path_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            if os.name == "nt":
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+            return True
+        with os.scandir(path) as entries:
+            children = list(entries)
+        for entry in children:
+            if self._cancel_event.is_set():
+                return False
+            child_rel = os.path.join(rel_path, entry.name)
+            is_directory = entry.is_dir(follow_symlinks=False)
+            if self.ignore_rules.matches(child_rel, is_directory):
+                continue
+            if is_directory:
+                self._remove_extra_directory(entry.path, child_rel)
+            else:
+                try:
+                    os.remove(entry.path)
+                except PermissionError:
+                    os.chmod(entry.path, stat.S_IWRITE)
+                    os.remove(entry.path)
+        if self._cancel_event.is_set():
+            return False
+        try:
+            try:
+                os.rmdir(path)
+            except PermissionError:
+                os.chmod(path, stat.S_IWRITE)
+                os.rmdir(path)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                return False
+            raise
 
     def _apply_db_operations(self, operations):
         if not operations:
@@ -315,12 +393,13 @@ class CopyManager(QObject):
                 conn.execute(
                     """
                     DELETE FROM file_snapshot
-                    WHERE (path=? OR path LIKE ?)
+                    WHERE (path=? OR substr(path, 1, ?)=?)
                       AND src_dir=? AND dst_dir=?
                     """,
                     (
                         rel_path,
-                        rel_path + "/%",
+                        len(rel_path + "/"),
+                        rel_path + "/",
                         source_dir,
                         target_dir,
                     ),

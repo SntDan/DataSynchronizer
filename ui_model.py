@@ -6,6 +6,7 @@ COLOR_GREEN = QColor("green")
 COLOR_ORANGE = QColor("orange")
 COLOR_RED = QColor("red")
 COLOR_GRAY = QColor("gray")
+COLOR_IGNORED = QColor("#9a9a9a")
 
 
 class TreeNode:
@@ -17,6 +18,10 @@ class TreeNode:
         "status",
         "size",
         "rel_path",
+        "pair_index",
+        "abs_path",
+        "is_directory",
+        "is_extra_group",
         "is_truncated_sync",
         "is_truncated_extra",
         "is_ellipsis_sync",
@@ -34,6 +39,10 @@ class TreeNode:
         self.status = ""
         self.size = 0
         self.rel_path = ""
+        self.pair_index = None
+        self.abs_path = ""
+        self.is_directory = False
+        self.is_extra_group = False
         self.is_truncated_sync = True
         self.is_truncated_extra = True
         self.is_ellipsis_sync = False
@@ -54,8 +63,8 @@ class TreeNode:
         for child in self.children:
             if child.is_ellipsis_extra or child.is_ellipsis_sync:
                 continue
-            is_extra = child.status in ("EXTRA", "EXTRA_DIR")
-            is_folder = bool(child.children) or child.status == "EXTRA_DIR"
+            is_extra = child.is_extra_group
+            is_folder = child.is_directory or bool(child.children)
             if is_folder and is_extra:
                 extra_folders.append(child)
             elif is_folder:
@@ -97,7 +106,7 @@ class TreeNode:
         )
         return self._cached_visible
 
-    def add_child(self, path_parts, status, size, rel_path):
+    def add_child(self, path_parts, status, size, rel_path, pair_index=None, abs_path=""):
         node = self
         last_index = len(path_parts) - 1
         for index, part in enumerate(path_parts):
@@ -111,6 +120,13 @@ class TreeNode:
                 child.status = status
                 child.size = size
                 child.rel_path = rel_path
+                child.abs_path = abs_path
+                child.is_extra_group = status in ("EXTRA", "EXTRA_DIR")
+            elif index > 0 or pair_index is None:
+                child.rel_path = "/".join(path_parts[1:index + 1] if pair_index is not None else path_parts[:index + 1])
+            child.pair_index = pair_index
+            child.is_directory = index < last_index or status in ("EXTRA_DIR", "IGNORED_DIR", "PRESERVED_DIR")
+            node._cached_visible = None
             node = child
 
     def row(self):
@@ -137,7 +153,8 @@ class DiffTreeModel(QAbstractItemModel):
         self.beginResetModel()
         add_child = self.rootItem.add_child
         for item in diffs:
-            status, rel_path, _, size = item[:4]
+            status, rel_path, abs_path, size = item[:4]
+            pair_index = None
             if len(item) >= 7:
                 source_dir, target_dir, pair_index = item[4:7]
                 pair_name = (
@@ -147,8 +164,37 @@ class DiffTreeModel(QAbstractItemModel):
             else:
                 parts = []
             parts.extend(rel_path.replace("\\", "/").split("/"))
-            add_child(parts, status, size, rel_path)
+            add_child(parts, status, size, rel_path, pair_index, abs_path)
         self.endResetModel()
+
+    def update_differences(self, diffs):
+        """Update scan-result metadata without moving rows or replacing nodes."""
+        changed_parents = set()
+        for item in diffs:
+            status, rel_path, abs_path, size = item[:4]
+            parts = rel_path.replace("\\", "/").split("/")
+            if len(item) >= 7:
+                source_dir, target_dir, pair_index = item[4:7]
+                parts.insert(0, f"[{pair_index + 1}] {source_dir} -> {target_dir}")
+            node = self.rootItem
+            for part in parts:
+                node = node.children_dict.get(part)
+                if node is None:
+                    break
+            if node is None:
+                continue
+            if (node.status, node.size, node.abs_path) != (status, size, abs_path):
+                node.status, node.size, node.abs_path = status, size, abs_path
+                changed_parents.add(node.parent)
+
+        # Keep the original grouping even when an EXTRA item becomes IGNORED.
+        # No reset/layout signal: selection, expansion, and pagination survive.
+        for parent in changed_parents:
+            children = parent.visible_children
+            if children:
+                first = self.createIndex(0, 0, children[0])
+                last = self.createIndex(len(children) - 1, 0, children[-1])
+                self.dataChanged.emit(first, last, [Qt.DisplayRole, Qt.ForegroundRole])
 
     def clear(self):
         self.beginResetModel()
@@ -197,12 +243,16 @@ class DiffTreeModel(QAbstractItemModel):
             if item.is_ellipsis_sync or item.is_ellipsis_extra:
                 return item.name
             if item.status:
-                if item.status == "EXTRA_DIR" or item.children:
+                if item.is_directory or item.children:
                     return f"[{item.status}] {item.name}"
                 return f"[{item.status}] {item.name} ({item.size} bytes)"
             return f"[DIR] {item.name}"
 
         if role == Qt.ForegroundRole:
+            if item.status in ("IGNORED", "IGNORED_DIR"):
+                return COLOR_IGNORED
+            if item.status == "PRESERVED_DIR":
+                return COLOR_GRAY
             if item.is_ellipsis_sync or item.is_ellipsis_extra:
                 return COLOR_GRAY
             if item.status == "NEW":

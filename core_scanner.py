@@ -1,19 +1,12 @@
 import os
 import sqlite3
+import stat
 from contextlib import closing
 
 import xxhash
 from PySide6.QtCore import QObject, Signal
 
-
-IGNORED_FILENAMES = {
-    "Thumbs.db",
-    "thumbs.db",
-    "desktop.ini",
-    "Desktop.ini",
-    ".DS_Store",
-    "$RECYCLE.BIN",
-}
+from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules
 
 
 def canonical_directory(path):
@@ -22,13 +15,23 @@ def canonical_directory(path):
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+def is_directory_link(entry, is_directory):
+    # Preserve links without traversing outside the configured path pair.
+    return entry.is_symlink() or (
+        is_directory
+        and getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
 class SyncScanner(QObject):
     progress_updated = Signal(int, int)
     diff_batch_found = Signal(list)
 
-    def __init__(self, db_path="sync_snapshot.db"):
+    def __init__(self, db_path="sync_snapshot.db", ignore_rules=None):
         super().__init__()
         self.db_path = db_path
+        self.ignore_rules = ignore_rules or IgnoreRules(DEFAULT_IGNORE_TEXT.splitlines())
         self._init_db()
 
     def _init_db(self):
@@ -173,7 +176,15 @@ class SyncScanner(QObject):
         scanned_count = 0
         source_files = set()
         source_dirs = set()
+        extra_directories = []
+        protected_dirs = set()
         separator = os.sep
+
+        def protect_parents(rel_path):
+            parent = rel_path.rpartition(separator)[0]
+            while parent:
+                protected_dirs.add(parent)
+                parent = parent.rpartition(separator)[0]
 
         def add_difference(status, rel_path, abs_path, size):
             differences.append(
@@ -197,6 +208,10 @@ class SyncScanner(QObject):
             size = source_stat.st_size
             mtime = source_stat.st_mtime
             source_files.add(rel_path)
+            if self.ignore_rules.matches(rel_path):
+                add_difference("IGNORED", rel_path, source_path, size)
+                scanned_count += 1
+                return
             target_path = (
                 target_dir
                 if target_is_file
@@ -255,42 +270,46 @@ class SyncScanner(QObject):
                                 if current_rel
                                 else entry.name
                             )
-                            try:
-                                is_directory = entry.is_dir(
-                                    follow_symlinks=False
-                                )
-                            except OSError:
-                                continue
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            is_link = is_directory_link(entry, is_directory)
+                            if is_link:
+                                is_directory = is_directory or entry.is_dir()
 
+                            if is_link or self.ignore_rules.matches(rel_path, is_directory):
+                                if is_directory:
+                                    source_dirs.add(rel_path)
+                                else:
+                                    source_files.add(rel_path)
+                                try:
+                                    size = 0 if is_directory else entry.stat(
+                                        follow_symlinks=False
+                                    ).st_size
+                                except OSError:
+                                    size = 0
+                                add_difference(
+                                    "IGNORED_DIR" if is_directory else "IGNORED",
+                                    rel_path, entry.path, size,
+                                )
+                                scanned_count += 1
+                                continue
                             if is_directory:
                                 source_dirs.add(rel_path)
                                 stack.append((entry.path, rel_path))
                                 continue
-                            if entry.name in IGNORED_FILENAMES:
-                                continue
-
-                            try:
-                                source_stat = entry.stat(
-                                    follow_symlinks=False
-                                )
-                            except OSError:
-                                continue
+                            source_stat = entry.stat(follow_symlinks=False)
 
                             compare_source_file(
                                 entry.path, rel_path, source_stat
                             )
-                except OSError:
-                    continue
+                except OSError as exc:
+                    raise OSError(f"Could not scan {current_path}: {exc}") from exc
 
         elif os.path.isfile(source_dir):
-            try:
-                compare_source_file(
-                    source_dir,
-                    os.path.basename(source_dir),
-                    os.stat(source_dir),
-                )
-            except OSError:
-                pass
+            compare_source_file(
+                source_dir,
+                os.path.basename(source_dir),
+                os.stat(source_dir),
+            )
 
         # A single-file pair only owns its same-named target file. It must not
         # treat unrelated contents of the target directory as mirror extras.
@@ -318,21 +337,30 @@ class SyncScanner(QObject):
                                 is_directory = entry.is_dir(
                                     follow_symlinks=False
                                 )
+                                is_link = is_directory_link(entry, is_directory)
+                                if is_link:
+                                    is_directory = is_directory or entry.is_dir()
                             except OSError:
                                 continue
 
+                            if is_link or self.ignore_rules.matches(rel_path, is_directory):
+                                protect_parents(rel_path)
+                                if is_link or (rel_path not in source_dirs and rel_path not in source_files):
+                                    try:
+                                        size = 0 if is_directory else entry.stat(
+                                            follow_symlinks=False
+                                        ).st_size
+                                    except OSError:
+                                        size = 0
+                                    add_difference(
+                                        "IGNORED_DIR" if is_directory else "IGNORED",
+                                        rel_path, entry.path, size,
+                                    )
+                                continue
                             if is_directory:
                                 if rel_path not in source_dirs:
-                                    add_difference(
-                                        "EXTRA_DIR", rel_path, entry.path, 0
-                                    )
-                                    # One parent entry is enough for mirror deletion.
-                                    # Skipping its subtree avoids a potentially huge
-                                    # second traversal of data absent from the source.
-                                    continue
+                                    extra_directories.append((rel_path, entry.path))
                                 stack.append((entry.path, rel_path))
-                                continue
-                            if entry.name in IGNORED_FILENAMES:
                                 continue
 
                             if rel_path not in source_files:
@@ -350,8 +378,17 @@ class SyncScanner(QObject):
                             if scanned_count % 500 == 0:
                                 self.progress_updated.emit(scanned_count, 0)
                 except OSError:
+                    protected_dirs.add(current_rel)
+                    protect_parents(current_rel)
                     continue
 
+        for rel_path, abs_path in extra_directories:
+            if is_cancelled():
+                return
+            add_difference(
+                "PRESERVED_DIR" if rel_path in protected_dirs else "EXTRA_DIR",
+                rel_path, abs_path, 0,
+            )
         if differences:
             self.diff_batch_found.emit(differences)
         self.progress_updated.emit(scanned_count, 0)

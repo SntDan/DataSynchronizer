@@ -1,0 +1,9 @@
+# DataSynchronizer ignore rules (relative to each path pair).
+# Supports gitignore syntax: *, **, ?, /folder/, and !exceptions.
+# Ignored items are displayed in gray and never copied or deleted.
+Thumbs.db
+thumbs.db
+desktop.ini
+Desktop.ini
+.DS_Store
+$RECYCLE.BIN/
