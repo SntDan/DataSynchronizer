@@ -19,7 +19,7 @@ A small PySide6 desktop tool for one-way file synchronization. It compares sourc
 - Resume interrupted copies
 - Toggle between xxHash64 content verification and fast metadata scanning
 - Keep synchronization history in a local SQLite snapshot database
-- Preserve read-only target files and show pending differences as `[READ_ONLY]`
+- Update read-only targets safely; preserve read-only mirror extras as `[READ_ONLY]`
 - Treat `/`, `\`, and Windows path casing consistently in scans, ignore rules, tree items and snapshots
 - Switch between English and Simplified Chinese
 - Persist global and pair-specific gitignore rules in `.syncignore`; hide global exclusions and show pair exclusions in gray
@@ -48,7 +48,7 @@ python main.py
 4. Click **1. Scan** to compare active pairs.
 5. Click **2. Sync** to copy confirmed changes.
 
-Temporary path changes do not write back to `config.json`. **Settings**, beside **Add Grp**, saves the content verification and mirror options to that file.
+Temporary path changes do not write back to `config.json` automatically. Click **Save Groups** at the lower right to save all current path pairs, including file/directory target types. Language, content verification and mirror options are in **Settings**, beside **Add Grp**, and take effect when you click **Apply**. **Cancel** closes Settings and discards changes made since the last Apply. A compact transfer speed display to the left of the progress bar refreshes every half second while synchronizing and is hidden when idle.
 
 ## Configuration
 
@@ -91,7 +91,7 @@ With **Verify contents (xxHash)** enabled in **Settings**, scanning compares the
 
 Content verification is off by default, using the original fast scan based on sizes, timestamps and saved snapshots without reading file contents. This mode can miss equal-sized content changes. The Settings dialog also contains **Remove extras**; both options are saved to `config.json` and restored at startup. Settings cannot be changed while scanning or synchronizing. Long status messages are truncated on the right with an ellipsis instead of widening the window; hover over the status to read the full text.
 
-Read-only target files with pending changes or mirror deletions appear as `[READ_ONLY]` and are preserved. Their read-only attribute is never cleared to force a file overwrite or deletion. A target that becomes read-only after scanning produces a synchronization error instead.
+Read-only target files with content changes appear as `[MODIFIED]` and can be updated. The original target stays read-only during copying; its read-only flag is cleared only immediately before replacing it with the complete staged file. The replacement follows the existing source-attribute rules. If replacement fails or is cancelled, the original target's read-only flag is restored. Actual access-denied errors are still reported, and read-only sources remain readable and copyable. Read-only mirror extras appear as `[READ_ONLY]` and are preserved without deletion.
 
 `.syncignore` lives beside `main.py` (or the packaged executable) and is created with default system-file exclusions if missing. Rules apply to paths relative to **each** source/target pair, on both sides. It supports gitignore syntax: comments (`#`), wildcards (`*.tmp`, `**/logs/`), root anchoring (`/report.txt`), directories (`cache/`), and exceptions (`!keep.tmp`). Windows matching is case insensitive. To include a file inside an ignored directory, first unignore the directory itself. For a single-file pair, rules match the original source filename, even if the target is renamed.
 
@@ -117,7 +117,9 @@ Closing the window during a scan, synchronization preparation or synchronization
 
 The default ignore file is restored at startup if it has been deleted. Directory junctions and symbolic links are preserved without traversing them. A source read error stops the scan and prevents synchronizing partial results. Interrupted copies only resume after verifying that the target matches the source prefix; copy and snapshot errors are reported instead of showing success.
 
-Files are staged in the target folder and replaced only after a complete copy and change checks. Cancellation or read errors preserve the existing target. Staging needs temporary space for the complete file. Verified prefixes contribute directly to the copy hash, avoiding a second full source read. Configuration and ignore-file updates also use atomic replacement.
+Files are staged in the target folder and replaced only after a complete copy and change checks. Cancellation or read errors preserve the existing target. Staging needs temporary space for the complete file. Windows uses native `CopyFileEx` with cancellation for files of at least 1 MiB and files with named data streams. Small files with only a main stream, unsupported operations and other platforms use buffered copying. Copying no longer computes an unused historical hash. The xxHash content-scan option still compares both current files in full. Configuration and ignore-file updates also use atomic replacement.
+
+Files of at least 64 MiB can retain incomplete copies in a reserved `.ds-sync/` directory beside the destination file. A later run checks the source and target identities, verifies the existing prefix against the source, and writes only the remaining data. A changed source/target restarts the copy; damaged or preallocated tails are never trusted. Internal state is hidden from scans and protected from mirror deletion independently of `.syncignore`. Removing it manually discards resume progress without changing the actual destination file. Files with Windows named data streams, or storage that cannot enumerate them, use a full native copy to preserve those streams.
 
 Folders that contain differences are always shown. If one folder has many changed files, only the first 10 files are shown at first; click **... Show All** to expand them.
 
@@ -132,6 +134,7 @@ An individual source file can target either a folder or a specific file. When ta
 ├── main.py           # UI and application entry point
 ├── core_scanner.py   # Directory scanner and diff engine
 ├── copy_manager.py   # Copy/delete engine with resume support
+├── file_transfer.py  # Native Windows copying and resumable-file ownership
 ├── ui_model.py       # Qt model for the diff tree
 ├── ignore_rules.py   # Gitignore-style matching and persistent rules
 ├── storage.py        # Atomic configuration and ignore-file writes
@@ -171,7 +174,7 @@ python -m PyInstaller --noconfirm --clean DataSynchronizer.spec
 - 支持中断后续传
 - 可切换 xxHash64 内容校验与按文件属性快速扫描
 - 使用本地 SQLite 快照数据库记录同步历史
-- 保留只读目标文件，将待处理差异标记为 `[READ_ONLY]`
+- 安全更新只读目标文件；镜像模式中保留只读多余文件并标记为 `[READ_ONLY]`
 - 扫描、忽略、树列表和快照统一处理正反斜杠及 Windows 路径大小写，避免误判多余文件
 - 支持英文和简体中文界面
 - 使用 `.syncignore` 保存全局和路径组忽略规则，全局忽略项隐藏，路径组忽略项显示为灰色
@@ -200,7 +203,7 @@ python main.py
 4. 点击「1. 扫描差异」查看结果。
 5. 点击「2. 开始同步」确认后执行复制。
 
-路径组的临时调整不会写回 `config.json`。「添加组」左侧的「设置」按钮可打开设置弹窗，保存内容校验和删除多余文件两个选项。
+路径组的临时调整不会自动写回 `config.json`。点击右下角的「保存组」，即可保存当前所有路径组（包括目标为文件或目录的类型）。语言、内容校验和删除多余文件选项集中在「添加组」左侧的「设置」中，点击「应用」保存并生效；「取消」关闭窗口并放弃尚未应用的修改。进度条左侧显示简洁的实时传输速度，同步时每半秒刷新，空闲时隐藏。
 
 ## 配置文件
 
@@ -243,7 +246,7 @@ python main.py
 
 内容校验默认关闭，采用原来按大小、时间和已有快照进行的快速扫描，不读取文件内容，可能漏掉同大小的内容变化。设置弹窗还包含「删除多余文件」，两个选项会保存到 `config.json`，下次启动时恢复。扫描和同步期间不可更改设置。底部状态过长时在右侧显示省略号，不会撑宽窗口；悬停可查看完整文字。
 
-只读目标文件如果需要覆盖或在镜像模式中删除，会显示为 `[READ_ONLY]` 并保留。程序不会清除文件的只读属性来强制覆盖或删除；扫描之后目标才变成只读时，会报告同步错误。
+需要更新内容的只读目标文件显示为 `[MODIFIED]`，可以正常同步。复制期间原目标保持只读，仅在完整临时文件即将替换目标时解除只读；替换后的文件沿用既有的源文件属性规则。替换失败或取消时，会恢复原目标的只读属性。真正的访问权限不足仍会报错，源文件只读不影响读取和复制。镜像模式中的只读多余文件仍标记为 `[READ_ONLY]`，保留而不删除。
 
 `.syncignore` 位于 `main.py`（打包后为可执行文件）的同级目录；文件不存在时，会自动创建并写入默认系统文件忽略规则。规则相对于**每组**源路径和目标路径的根目录，对两端均生效。支持 gitignore 风格的注释（`#`）、通配符（`*.tmp`、`**/logs/`）、根路径匹配（`/report.txt`）、目录规则（`cache/`）和例外（`!keep.tmp`）。Windows 下匹配不区分大小写。若要保留被忽略目录内某个文件参与同步，需先取消对该目录本身的忽略。单文件组按源文件的原始文件名匹配，目标重命名不影响规则。
 
@@ -269,7 +272,9 @@ Thumbs.db
 
 忽略文件被删除后，下次启动会恢复默认文件。目录联接和符号链接会保留且不继续遍历。读取源目录出错时，中止扫描并禁止同步残缺结果。断点续传前会核对已有内容与源文件是否一致；复制和快照写入失败会明确提示，不会显示同步成功。
 
-文件先在目标文件夹中完整生成，通过变化检查后再替换原文件。取消或读取失败会保留原目标，因此需要容纳完整文件的临时空间。已验证的前缀直接参与复制哈希，不再额外重读整个源文件。配置和忽略文件也采用原子替换保存。
+文件先在目标文件夹中完整生成，通过变化检查后再替换原文件。取消或读取失败会保留原目标，因此需要容纳完整文件的临时空间。Windows 对至少 1 MiB 的文件，以及带附加数据流的文件，使用支持取消的原生 `CopyFileEx`；仅有主数据流的小文件、原生操作不受支持时，以及其他平台上，采用缓冲复制。复制时不再计算未被使用的历史哈希；内容校验选项仍完整读取两端文件进行 xxHash 比较。配置和忽略文件也采用原子替换保存。
+
+至少 64 MiB 的文件可以将未完成内容保存在目标文件旁的专用 `.ds-sync/` 目录中。下次同步会检查源和目标的身份，并逐块验证已有前缀，仅继续写入剩余部分。源或目标发生变化时重新复制；损坏内容和预分配的尾部不会被直接当作已完成数据。内部状态独立于 `.syncignore`，始终从扫描中隐藏并防止被镜像删除。手动删除该目录只会清除续传进度，不会改变实际目标文件。带 Windows 附加数据流的文件，或无法枚举数据流的存储，使用完整原生复制来保留这些内容。
 
 所有包含差异的文件夹都会显示。单个文件夹内文件过多时，默认只显示前 10 个文件，点击 **... Show All** 可展开其余内容。
 
@@ -284,6 +289,7 @@ Thumbs.db
 ├── main.py           # 界面和程序入口
 ├── core_scanner.py   # 目录扫描和差异比较
 ├── copy_manager.py   # 复制和删除逻辑，支持续传
+├── file_transfer.py  # Windows 原生复制和续传文件的独占保护
 ├── ui_model.py       # 差异树的 Qt 数据模型
 ├── ignore_rules.py   # Gitignore 风格匹配和忽略规则保存
 ├── storage.py        # 配置和忽略文件的原子保存

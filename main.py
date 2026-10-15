@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import threading
+import time
 import subprocess
 from pathlib import Path
 from itertools import zip_longest
@@ -11,6 +12,7 @@ from PySide6.QtGui import QDesktopServices, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -71,22 +73,24 @@ UI_TEXTS = {
         "remove_group_btn": "删除组",
         "mirror_chk": "删除多余文件",
         "settings_btn": "设置",
-        "settings_save": "保存",
+        "save_pairs": "保存组",
+        "pairs_saved": "目录对已保存",
+        "settings_apply": "应用",
         "settings_cancel": "取消",
+        "language_label": "语言",
         "settings_error": "无法保存设置：\n{}",
         "verify_chk": "内容校验（xxHash）",
         "verify_tip": "开启：读取两端文件并比较内容。关闭：按大小、时间和快照快速扫描。",
         "scan_btn": "1. 扫描差异",
         "sync_btn": "2. 开始同步",
         "stop_btn": "停止",
-        "lang_btn": "English",
         "ready": "就绪",
         "scanning": "正在扫描第 {} / {} 组",
         "stopping": "正在停止扫描……",
         "scan_stopped": "扫描已停止",
-        "scan_done": "扫描完成  新增: {}，修改: {}，多余: {}，忽略: {}，只读: {}",
+        "scan_done": "扫描完成  新增: {}，修改: {}，多余: {}，忽略: {}，只读保留: {}",
         "hash_check": "正在校验第 {} / {} 组：{}",
-        "sync_read_only": "\n只读目标: {} 项，将保留，不覆盖或删除。",
+        "sync_read_only": "\n只读多余文件: {} 项，将保留，不删除。",
         "scan_prog": "正在扫描第 {} / {} 组，已检查 {} 个文件",
         "start_sync": "准备开始同步",
         "sync_prog": "正在同步: {} / {}",
@@ -144,22 +148,24 @@ UI_TEXTS = {
         "remove_group_btn": "Del Grp",
         "mirror_chk": "Remove extras",
         "settings_btn": "Settings",
-        "settings_save": "Save",
+        "save_pairs": "Save Groups",
+        "pairs_saved": "Directory pairs saved",
+        "settings_apply": "Apply",
         "settings_cancel": "Cancel",
+        "language_label": "Language",
         "settings_error": "Could not save settings:\n{}",
         "verify_chk": "Verify contents (xxHash)",
         "verify_tip": "On: read and compare both files. Off: scan quickly using sizes, timestamps and snapshots.",
         "scan_btn": "1. Scan",
         "sync_btn": "2. Sync",
         "stop_btn": "Stop",
-        "lang_btn": "中文",
         "ready": "Ready",
         "scanning": "Scanning pair {} / {}",
         "stopping": "Stopping scan…",
         "scan_stopped": "Scan stopped",
-        "scan_done": "Scan complete  New: {}, Modified: {}, Extra: {}, Ignored: {}, Read-only: {}",
+        "scan_done": "Scan complete  New: {}, Modified: {}, Extra: {}, Ignored: {}, Read-only kept: {}",
         "hash_check": "Verifying pair {} / {}: {}",
-        "sync_read_only": "\nRead-only targets: {}; preserved without overwriting or deleting.",
+        "sync_read_only": "\nRead-only extra files: {}; preserved without deletion.",
         "scan_prog": "Scanning pair {} / {}, checked {} files",
         "start_sync": "Preparing to synchronize",
         "sync_prog": "Synchronizing: {} / {}",
@@ -296,37 +302,61 @@ def paths_overlap(left, left_is_directory, right, right_is_directory):
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle(parent.get_text("settings_btn"))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 16)
         layout.setSpacing(16)
-        self.mirror_checkbox = QCheckBox(parent.get_text("mirror_chk"))
+        self.language_label = QLabel()
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("中文", "zh_CN")
+        self.language_combo.addItem("English", "en_US")
+        self.language_combo.setCurrentIndex(self.language_combo.findData(parent.current_lang))
+        language_layout = QHBoxLayout()
+        style = self.style()
+        language_layout.setContentsMargins(
+            style.pixelMetric(QStyle.PM_IndicatorWidth)
+            + style.pixelMetric(QStyle.PM_CheckBoxLabelSpacing), 0, 0, 0
+        )
+        language_layout.addWidget(self.language_label)
+        language_layout.addWidget(self.language_combo, 1)
+        layout.addLayout(language_layout)
+        self.mirror_checkbox = QCheckBox()
         self.mirror_checkbox.setStyleSheet("QCheckBox:checked { color: red; }")
         self.mirror_checkbox.setChecked(parent.mirror_mode)
-        self.verify_checkbox = QCheckBox(parent.get_text("verify_chk"))
-        self.verify_checkbox.setToolTip(parent.get_text("verify_tip"))
+        self.verify_checkbox = QCheckBox()
         self.verify_checkbox.setChecked(parent.verify_contents)
         layout.addWidget(self.mirror_checkbox)
         layout.addWidget(self.verify_checkbox)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText(parent.get_text("settings_save"))
-        buttons.button(QDialogButtonBox.Cancel).setText(parent.get_text("settings_cancel"))
-        buttons.accepted.connect(self.save)
+        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
+        self.apply_button = buttons.button(QDialogButtonBox.Apply)
+        self.cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        self.apply_button.clicked.connect(self.save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.update_ui_texts()
+
+    def update_ui_texts(self):
+        text = self.parent().get_text
+        self.setWindowTitle(text("settings_btn"))
+        self.language_label.setText(text("language_label"))
+        self.mirror_checkbox.setText(text("mirror_chk"))
+        self.verify_checkbox.setText(text("verify_chk"))
+        self.verify_checkbox.setToolTip(text("verify_tip"))
+        self.apply_button.setText(text("settings_apply"))
+        self.cancel_button.setText(text("settings_cancel"))
 
     def save(self):
+        parent = self.parent()
         try:
-            self.parent().save_settings(
-                self.verify_checkbox.isChecked(), self.mirror_checkbox.isChecked()
+            parent.save_settings(
+                self.verify_checkbox.isChecked(), self.mirror_checkbox.isChecked(),
+                language=self.language_combo.currentData(),
             )
         except (OSError, ValueError, TypeError) as exc:
             QMessageBox.warning(
-                self, self.parent().get_text("warn_title"),
-                self.parent().get_text("settings_error", exc),
+                self, parent.get_text("warn_title"), parent.get_text("settings_error", exc),
             )
             return
-        self.accept()
+        self.update_ui_texts()
 
 
 class PathButtonStyle(QProxyStyle):
@@ -537,9 +567,9 @@ class MainWindow(QMainWindow):
         self.list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self.show_file_context_menu)
 
-        self.lang_btn = QPushButton()
-        self.lang_btn.setFixedSize(96, 30)
-        self.lang_btn.clicked.connect(self.toggle_language)
+        self.save_pairs_btn = QPushButton()
+        self.save_pairs_btn.setFixedSize(96, 30)
+        self.save_pairs_btn.clicked.connect(self.save_directory_pairs)
 
         action_layout = QHBoxLayout()
         action_layout.setSpacing(8)
@@ -566,7 +596,7 @@ class MainWindow(QMainWindow):
         right_action_layout = QHBoxLayout()
         right_action_layout.setSpacing(26)
         right_action_layout.addWidget(self.stop_btn)
-        right_action_layout.addWidget(self.lang_btn)
+        right_action_layout.addWidget(self.save_pairs_btn)
 
         operation_layout = QGridLayout()
         operation_layout.setContentsMargins(3, 0, 9, 0)
@@ -584,6 +614,14 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(
             "QLabel { font-size: 10pt; font-weight: normal; }"
         )
+        self.speed_label = QLabel()
+        self.speed_label.hide()
+        self.speed_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.speed_label.setMinimumWidth(80)
+        self.speed_label.setStyleSheet("QLabel { font-size: 9pt; }")
+        self.speed_timer = QTimer(self)
+        self.speed_timer.setInterval(500)
+        self.speed_timer.timeout.connect(self._update_copy_speed)
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setRange(0, 100)
@@ -592,6 +630,7 @@ class MainWindow(QMainWindow):
         status_layout = QHBoxLayout()
         status_layout.setSpacing(10)
         status_layout.addWidget(self.status_label, 1)
+        status_layout.addWidget(self.speed_label)
         status_layout.addWidget(
             self.progress_bar, 0, Qt.AlignRight | Qt.AlignVCenter
         )
@@ -867,7 +906,7 @@ class MainWindow(QMainWindow):
         self.scan_btn.setText(self.get_text("scan_btn"))
         self.sync_btn.setText(self.get_text("sync_btn"))
         self.stop_btn.setText(self.get_text("stop_btn"))
-        self.lang_btn.setText(self.get_text("lang_btn"))
+        self.save_pairs_btn.setText(self.get_text("save_pairs"))
         self._render_status()
 
     def set_status(self, key, *args):
@@ -880,12 +919,6 @@ class MainWindow(QMainWindow):
             self.get_text(self.status_key, *self.status_args)
         )
 
-    def toggle_language(self):
-        self.current_lang = (
-            "en_US" if self.current_lang == "zh_CN" else "zh_CN"
-        )
-        self.update_ui_texts()
-
     def show_settings(self):
         if self._task_running() or self._closing:
             return
@@ -893,9 +926,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
-    def save_settings(self, verify_contents, mirror_mode):
-        if self._task_running() or self._closing:
-            return
+    def _save_config_changes(self, **changes):
         try:
             with CONFIG_PATH.open("r", encoding="utf-8") as file_obj:
                 data = json.load(file_obj)
@@ -903,9 +934,39 @@ class MainWindow(QMainWindow):
             data = dict(self.config)
         if not isinstance(data, dict):
             raise ValueError("config.json must be an object")
-        data.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        data.update(changes)
         _write_config(data)
-        self.config.update(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        self.config.update(data)
+
+    def save_directory_pairs(self):
+        if self._task_running() or self._closing:
+            return
+        try:
+            self._save_config_changes(directory_pairs=[
+                {
+                    "source": row["source_input"].text().strip(),
+                    "target": row["target_input"].text().strip(),
+                    "target_type": row["target_input"].property("path_type") or "",
+                }
+                for row in self.path_rows
+            ])
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self, self.get_text("warn_title"), self.get_text("settings_error", exc)
+            )
+            return
+        self.set_status("pairs_saved")
+
+    def save_settings(self, verify_contents, mirror_mode, *, language=None):
+        if self._task_running() or self._closing:
+            return
+        changes = dict(verify_contents=verify_contents, mirror_mode=mirror_mode)
+        if language is not None:
+            changes["default_language"] = language
+        self._save_config_changes(**changes)
+        if language is not None:
+            self.current_lang = language
+            self.update_ui_texts()
         verification_changed = self.verify_contents != verify_contents
         self.verify_contents = verify_contents
         self.mirror_mode = mirror_mode
@@ -936,6 +997,7 @@ class MainWindow(QMainWindow):
         self.add_group_btn.setEnabled(not busy)
         self.scan_btn.setEnabled(not busy)
         self.settings_btn.setEnabled(not busy)
+        self.save_pairs_btn.setEnabled(not busy)
         self.stop_btn.setVisible(busy and scanning)
         self.stop_btn.setEnabled(busy and scanning)
         if busy:
@@ -1328,11 +1390,30 @@ class MainWindow(QMainWindow):
         self.set_status("start_sync")
         self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
         self.progress_bar.setValue(0)
+        self.speed_label.setText("0 B/s")
+        self.speed_label.show()
+        self._speed_sample = (time.monotonic(), 0)
         self.copy_mgr.start_sync(
             self.diff_data_full,
             mirror_mode=is_mirror,
             ignore_rules=worker.rules,
         )
+        self.speed_timer.start()
+
+    def _update_copy_speed(self):
+        now = time.monotonic()
+        copied = self.copy_mgr.bytes_copied
+        previous_time, previous_bytes = self._speed_sample
+        elapsed = now - previous_time
+        if elapsed <= 0:
+            return
+        speed = max(0, copied - previous_bytes) / elapsed
+        self._speed_sample = (now, copied)
+        for unit in ("B/s", "KB/s", "MB/s", "GB/s", "TB/s"):
+            if speed < 1024 or unit == "TB/s":
+                break
+            speed /= 1024
+        self.speed_label.setText(f"{speed:.1f} {unit}" if unit != "B/s" else f"{speed:.0f} {unit}")
 
     def on_copy_overall_progress(self, current, total):
         self.progress_bar.setRange(0, max(total, 1))
@@ -1340,6 +1421,9 @@ class MainWindow(QMainWindow):
         self.set_status("sync_prog", current, total)
 
     def on_copy_finished(self):
+        self.speed_timer.stop()
+        self.speed_label.clear()
+        self.speed_label.hide()
         if self._closing:
             return
         self.progress_bar.setValue(self.progress_bar.maximum())

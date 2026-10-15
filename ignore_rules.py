@@ -9,6 +9,9 @@ from pathspec import GitIgnoreSpec
 from storage import write_text_atomic
 
 
+COPY_STATE_DIRECTORY = ".ds-sync"
+
+
 DEFAULT_IGNORE_TEXT = """# DataSynchronizer ignore rules (relative to each path pair).
 # Supports gitignore syntax: *, **, ?, /folder/, and !exceptions.
 # Global exclusions are hidden; pair exclusions are displayed in gray.
@@ -86,6 +89,11 @@ class IgnoreRules:
         return self._pairs[key]
 
     def global_matches(self, rel_path, is_directory=False):
+        # This reserved work directory is protected independently of user
+        # patterns, including exception rules that would otherwise re-include it.
+        path = "/" + relative_path_key(rel_path).strip("/") + ("/" if is_directory else "")
+        if f"/{COPY_STATE_DIRECTORY}/" in path:
+            return True
         return self._matches(self.global_spec, self._global_directory_matches, rel_path, is_directory)
 
     def pair_matches(self, rel_path, is_directory=False):

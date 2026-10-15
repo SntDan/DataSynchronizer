@@ -310,8 +310,6 @@ class SyncScanner(QObject):
                             raise OSError(f"File changed during verification: {path}")
                     if source_hash != target_hash:
                         status = "MODIFIED"
-                if status == "MODIFIED" and is_read_only(target_stat):
-                    status = "READ_ONLY"
 
             if status:
                 add_difference(status, rel_path, source_path, size)

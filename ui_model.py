@@ -311,13 +311,13 @@ class DiffTreeModel(QAbstractItemModel):
         if role == Qt.ForegroundRole:
             if item.status in ("IGNORED", "IGNORED_DIR"):
                 return COLOR_IGNORED
-            if item.status == "PRESERVED_DIR":
+            if item.status in ("PRESERVED_DIR", "READ_ONLY"):
                 return COLOR_GRAY
             if item.is_ellipsis_sync or item.is_ellipsis_extra:
                 return COLOR_GRAY
             if item.status == "NEW":
                 return COLOR_GREEN
-            if item.status in ("MODIFIED", "READ_ONLY"):
+            if item.status == "MODIFIED":
                 return COLOR_ORANGE
             if item.status in ("EXTRA", "EXTRA_DIR"):
                 return COLOR_RED if self.is_mirror_mode else COLOR_GRAY
