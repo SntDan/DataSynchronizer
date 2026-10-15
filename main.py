@@ -3,6 +3,8 @@ import os
 import sys
 import threading
 import time
+import stat
+from concurrent.futures import CancelledError
 import subprocess
 from pathlib import Path
 from itertools import zip_longest
@@ -14,7 +16,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -42,6 +43,7 @@ from core_scanner import SyncScanner
 from ui_model import DiffTreeModel
 from ignore_rules import IgnoreRules, append_ignore_path, apply_ignore_rules, relative_path_key
 from storage import write_text_atomic
+from path_access import inspect_target, require_readable_directory, run_access_check
 
 
 APP_DIR = (
@@ -77,7 +79,6 @@ UI_TEXTS = {
         "pairs_saved": "目录对已保存",
         "settings_apply": "应用",
         "settings_cancel": "取消",
-        "language_label": "语言",
         "settings_error": "无法保存设置：\n{}",
         "verify_chk": "内容校验（xxHash）",
         "verify_tip": "开启：读取两端文件并比较内容。关闭：按大小、时间和快照快速扫描。",
@@ -152,7 +153,6 @@ UI_TEXTS = {
         "pairs_saved": "Directory pairs saved",
         "settings_apply": "Apply",
         "settings_cancel": "Cancel",
-        "language_label": "Language",
         "settings_error": "Could not save settings:\n{}",
         "verify_chk": "Verify contents (xxHash)",
         "verify_tip": "On: read and compare both files. Off: scan quickly using sizes, timestamps and snapshots.",
@@ -290,13 +290,58 @@ def _write_config(data):
 
 
 def paths_overlap(left, left_is_directory, right, right_is_directory):
-    left = os.path.normcase(os.path.realpath(left))
-    right = os.path.normcase(os.path.realpath(right))
+    left = os.path.normcase(os.path.normpath(left))
+    right = os.path.normcase(os.path.normpath(right))
     try:
         common = os.path.commonpath((left, right))
     except ValueError:
         return False
     return left == right or (left_is_directory and common == left) or (right_is_directory and common == right)
+
+
+def validate_directory_pairs(entered_pairs, language=DEFAULT_LANGUAGE):
+    def reject(key, *args):
+        raise ValueError(UI_TEXTS[language][key].format(*args))
+
+    pairs, owned_paths = [], []
+    for index, (source, target, target_is_file) in enumerate(entered_pairs, start=1):
+        source, target = (
+            os.path.normpath(os.path.abspath(os.path.expandvars(os.path.expanduser(path))))
+            for path in (source, target)
+        )
+        source_info = os.stat(source)
+        source_is_directory = stat.S_ISDIR(source_info.st_mode)
+        if not source_is_directory and not stat.S_ISREG(source_info.st_mode):
+            reject("warn_source", source)
+        if source_is_directory:
+            require_readable_directory(source)
+        else:
+            with open(source, "rb"):
+                pass
+        target_info, target_guard = inspect_target(target)
+        require_readable_directory(target_guard)
+        if target_info is not None:
+            target_is_file = not stat.S_ISDIR(target_info.st_mode)
+            if target_is_file and not stat.S_ISREG(target_info.st_mode):
+                raise OSError(f"Target is not a regular file: {target}")
+        if source_is_directory and target_is_file:
+            reject("warn_dir_to_file", index)
+        destination = target if source_is_directory or target_is_file else os.path.join(target, os.path.basename(source))
+        resolved_source = os.path.realpath(source)
+        destination = os.path.realpath(destination)
+        if paths_overlap(resolved_source, source_is_directory, destination, source_is_directory):
+            same = os.path.normcase(source) == os.path.normcase(destination)
+            reject(("warn_same" if source_is_directory else "warn_same_file") if same else "warn_overlap", index)
+        for other_index, (other_source, other_destination, other_is_directory) in enumerate(owned_paths, start=1):
+            if (
+                paths_overlap(destination, source_is_directory, other_destination, other_is_directory)
+                or paths_overlap(resolved_source, source_is_directory, other_destination, other_is_directory)
+                or paths_overlap(destination, source_is_directory, other_source, other_is_directory)
+            ):
+                reject("warn_pair_overlap", other_index, index)
+        owned_paths.append((resolved_source, destination, source_is_directory))
+        pairs.append((source, target, target_is_file))
+    return pairs
 
 
 class SettingsDialog(QDialog):
@@ -305,20 +350,11 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 16)
         layout.setSpacing(16)
-        self.language_label = QLabel()
         self.language_combo = QComboBox()
         self.language_combo.addItem("中文", "zh_CN")
         self.language_combo.addItem("English", "en_US")
         self.language_combo.setCurrentIndex(self.language_combo.findData(parent.current_lang))
-        language_layout = QHBoxLayout()
-        style = self.style()
-        language_layout.setContentsMargins(
-            style.pixelMetric(QStyle.PM_IndicatorWidth)
-            + style.pixelMetric(QStyle.PM_CheckBoxLabelSpacing), 0, 0, 0
-        )
-        language_layout.addWidget(self.language_label)
-        language_layout.addWidget(self.language_combo, 1)
-        layout.addLayout(language_layout)
+        layout.addWidget(self.language_combo)
         self.mirror_checkbox = QCheckBox()
         self.mirror_checkbox.setStyleSheet("QCheckBox:checked { color: red; }")
         self.mirror_checkbox.setChecked(parent.mirror_mode)
@@ -326,18 +362,21 @@ class SettingsDialog(QDialog):
         self.verify_checkbox.setChecked(parent.verify_contents)
         layout.addWidget(self.mirror_checkbox)
         layout.addWidget(self.verify_checkbox)
-        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
-        self.apply_button = buttons.button(QDialogButtonBox.Apply)
-        self.cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        self.apply_button = QPushButton()
+        self.apply_button.setDefault(True)
+        self.cancel_button = QPushButton()
         self.apply_button.clicked.connect(self.save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.apply_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
         self.update_ui_texts()
 
     def update_ui_texts(self):
         text = self.parent().get_text
         self.setWindowTitle(text("settings_btn"))
-        self.language_label.setText(text("language_label"))
         self.mirror_checkbox.setText(text("mirror_chk"))
         self.verify_checkbox.setText(text("verify_chk"))
         self.verify_checkbox.setToolTip(text("verify_tip"))
@@ -356,7 +395,7 @@ class SettingsDialog(QDialog):
                 self, parent.get_text("warn_title"), parent.get_text("settings_error", exc),
             )
             return
-        self.update_ui_texts()
+        self.accept()
 
 
 class PathButtonStyle(QProxyStyle):
@@ -385,8 +424,9 @@ class PathButtonStyle(QProxyStyle):
 class ElidedLabel(QLabel):
     """Keep full status text without letting it determine the window width."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, ellipsis="…"):
         super().__init__(parent)
+        self.ellipsis = ellipsis
         self.setTextFormat(Qt.PlainText)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
@@ -401,9 +441,14 @@ class ElidedLabel(QLabel):
         self.setToolTip(text)
 
     def elided_text(self):
-        return self.fontMetrics().elidedText(
-            self.text().replace("\n", " "), Qt.ElideRight, self.contentsRect().width()
-        )
+        text = self.text().replace("\n", " ")
+        metrics = self.fontMetrics()
+        width = self.contentsRect().width()
+        if metrics.horizontalAdvance(text) <= width:
+            return text
+        width -= max(0, metrics.horizontalAdvance(self.ellipsis) - metrics.horizontalAdvance("…"))
+        result = metrics.elidedText(text, Qt.ElideRight, max(0, width))
+        return result[:-1] + self.ellipsis if result.endswith("…") else result
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -414,12 +459,14 @@ class ElidedLabel(QLabel):
 
 
 class SyncWorker(QThread):
+    pairs_validated = Signal(list)
     pair_started = Signal(int, int)
     failed = Signal(str)
 
-    def __init__(self, scanner, directory_pairs, verify_contents=False):
+    def __init__(self, scanner, directory_pairs, verify_contents=False, language=DEFAULT_LANGUAGE):
         super().__init__()
         self.scanner = scanner
+        self.language = language
         self.directory_pairs = directory_pairs
         self.verify_contents = verify_contents
         self.cancel_event = threading.Event()
@@ -434,6 +481,12 @@ class SyncWorker(QThread):
         collect = self.differences.extend
         self.scanner.diff_batch_found.connect(collect, Qt.DirectConnection)
         try:
+            pairs, language = self.directory_pairs, self.language
+            self.directory_pairs = run_access_check(
+                lambda: validate_directory_pairs(pairs, language), self.cancel_event,
+                "\n".join(f"{source} -> {target}" for source, target, _ in pairs),
+            )
+            self.pairs_validated.emit(self.directory_pairs)
             for index, pair in enumerate(self.directory_pairs):
                 source_dir, target_dir, target_is_file = pair
                 if self.cancel_event.is_set():
@@ -455,9 +508,17 @@ class SyncWorker(QThread):
                 self.differences, self.scanner.ignore_rules, self.cancel_event
             )
             self.was_cancelled = self.cancel_event.is_set()
+        except CancelledError:
+            self.was_cancelled = True
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.was_cancelled = self.cancel_event.is_set()
+            self.differences.clear()
+            if not self.was_cancelled:
+                self.failed.emit(str(exc))
         finally:
+            if self.was_cancelled or self.cancel_event.is_set():
+                self.was_cancelled = True
+                self.differences.clear()
             self.scanner.diff_batch_found.disconnect(collect)
 
 
@@ -614,6 +675,8 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(
             "QLabel { font-size: 10pt; font-weight: normal; }"
         )
+        self.current_file_label = ElidedLabel(ellipsis="...")
+        self.current_file_label.hide()
         self.speed_label = QLabel()
         self.speed_label.hide()
         self.speed_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -630,6 +693,7 @@ class MainWindow(QMainWindow):
         status_layout = QHBoxLayout()
         status_layout.setSpacing(10)
         status_layout.addWidget(self.status_label, 1)
+        status_layout.addWidget(self.current_file_label, 1)
         status_layout.addWidget(self.speed_label)
         status_layout.addWidget(
             self.progress_bar, 0, Qt.AlignRight | Qt.AlignVCenter
@@ -692,7 +756,7 @@ class MainWindow(QMainWindow):
             "path_type",
             target_type
             if target_type in ("file", "directory")
-            else ("file" if os.path.isfile(target) else "directory"),
+            else "",
         )
         target_change = QToolButton()
         target_change.setStyle(self.path_button_style)
@@ -1005,93 +1069,33 @@ class MainWindow(QMainWindow):
         else:
             self._update_sync_enabled()
 
-    def _validated_pairs(self):
-        if not self.path_rows:
-            QMessageBox.warning(
-                self,
-                self.get_text("warn_title"),
-                self.get_text("warn_empty"),
-            )
+    def _entered_pairs(self):
+        pairs = [
+            (row["source_input"].text().strip(), row["target_input"].text().strip(),
+             row["target_input"].property("path_type") == "file")
+            for row in self.path_rows
+        ]
+        if not pairs or any(not source or not target for source, target, _ in pairs):
+            QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("warn_empty"))
             return None
-
-        pairs, owned_paths = [], []
-        for index, row in enumerate(self.path_rows, start=1):
-            source = row["source_input"].text().strip()
-            target = row["target_input"].text().strip()
-            if not source or not target:
-                QMessageBox.warning(
-                    self,
-                    self.get_text("warn_title"),
-                    self.get_text("warn_empty"),
-                )
-                return None
-            source = os.path.normpath(
-                os.path.abspath(os.path.expandvars(os.path.expanduser(source)))
-            )
-            target = os.path.normpath(
-                os.path.abspath(os.path.expandvars(os.path.expanduser(target)))
-            )
-            source_is_directory = os.path.isdir(source)
-            if not source_is_directory and not os.path.isfile(source):
-                QMessageBox.warning(
-                    self,
-                    self.get_text("warn_title"),
-                    self.get_text("warn_source", source),
-                )
-                return None
-            target_is_file = row["target_input"].property("path_type") == "file"
-            if os.path.isfile(target):
-                target_is_file = True
-            elif os.path.isdir(target):
-                target_is_file = False
-
-            if source_is_directory and target_is_file:
-                QMessageBox.warning(
-                    self,
-                    self.get_text("warn_title"),
-                    self.get_text("warn_dir_to_file", index),
-                )
-                return None
-
-            destination = target if source_is_directory or target_is_file else os.path.join(target, os.path.basename(source))
-            if paths_overlap(source, source_is_directory, destination, source_is_directory):
-                same_destination = os.path.normcase(source) == os.path.normcase(destination)
-                QMessageBox.warning(
-                    self,
-                    self.get_text("warn_title"),
-                    self.get_text(
-                        ("warn_same" if source_is_directory else "warn_same_file") if same_destination else "warn_overlap",
-                        index,
-                    ),
-                )
-                return None
-
-            for other_index, (other_source, other_destination, other_is_directory) in enumerate(owned_paths, start=1):
-                if (
-                    paths_overlap(destination, source_is_directory, other_destination, other_is_directory)
-                    or paths_overlap(source, source_is_directory, other_destination, other_is_directory)
-                    or paths_overlap(destination, source_is_directory, other_source, other_is_directory)
-                ):
-                    QMessageBox.warning(self, self.get_text("warn_title"), self.get_text("warn_pair_overlap", other_index, index))
-                    return None
-            owned_paths.append((source, destination, source_is_directory))
-
-            pairs.append((source, target, target_is_file))
-        # Normalize editors only after all pairs have passed validation.
-        for row, (source, target, target_is_file) in zip(self.path_rows, pairs):
-            row["source_input"].setText(source)
-            row["target_input"].setText(target)
-            row["target_input"].setProperty(
-                "path_type", "file" if target_is_file else "directory"
-            )
-            self._show_path_end(row["source_input"])
-            self._show_path_end(row["target_input"])
         return pairs
+
+    def on_pairs_validated(self, pairs):
+        if self._closing or self.scan_worker.cancel_event.is_set():
+            return
+        self.directory_pairs = pairs
+        for row, (source, target, target_is_file) in zip(self.path_rows, pairs):
+            for editor, text in ((row["source_input"], source), (row["target_input"], target)):
+                editor.blockSignals(True)
+                editor.setText(text)
+                editor.blockSignals(False)
+                self._show_path_end(editor)
+            row["target_input"].setProperty("path_type", "file" if target_is_file else "directory")
 
     def start_scan(self):
         if self._task_running() or self._closing:
             return
-        pairs = self._validated_pairs()
+        pairs = self._entered_pairs()
         if pairs is None:
             return
         try:
@@ -1108,7 +1112,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self._set_task_busy(True, scanning=True)
 
-        self.scan_worker = SyncWorker(self.scanner, pairs, self.verify_contents)
+        self.scan_worker = SyncWorker(self.scanner, pairs, self.verify_contents, self.current_lang)
+        self.scan_worker.pairs_validated.connect(self.on_pairs_validated)
         self.scan_worker.pair_started.connect(self.on_pair_started)
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_worker.finished.connect(self.on_scan_finished)
@@ -1390,6 +1395,8 @@ class MainWindow(QMainWindow):
         self.set_status("start_sync")
         self.progress_bar.setRange(0, max(len(self.diff_data_full), 1))
         self.progress_bar.setValue(0)
+        self.current_file_label.clear()
+        self.current_file_label.show()
         self.speed_label.setText("0 B/s")
         self.speed_label.show()
         self._speed_sample = (time.monotonic(), 0)
@@ -1401,6 +1408,9 @@ class MainWindow(QMainWindow):
         self.speed_timer.start()
 
     def _update_copy_speed(self):
+        name = self.copy_mgr.current_file_name
+        if name != self.current_file_label.text():
+            self.current_file_label.setText(name)
         now = time.monotonic()
         copied = self.copy_mgr.bytes_copied
         previous_time, previous_bytes = self._speed_sample
@@ -1422,6 +1432,9 @@ class MainWindow(QMainWindow):
 
     def on_copy_finished(self):
         self.speed_timer.stop()
+        self.current_file_label.clear()
+        self.current_file_label.setToolTip("")
+        self.current_file_label.hide()
         self.speed_label.clear()
         self.speed_label.hide()
         if self._closing:

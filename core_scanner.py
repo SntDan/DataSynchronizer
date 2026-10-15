@@ -8,6 +8,7 @@ import xxhash
 from PySide6.QtCore import QObject, Signal
 
 from ignore_rules import DEFAULT_IGNORE_TEXT, IgnoreRules, relative_path_key
+from path_access import check_missing_error, inspect_target, require_readable_directory
 
 
 def canonical_directory(path):
@@ -195,6 +196,20 @@ class SyncScanner(QObject):
         is_cancelled = (
             cancel_event.is_set if cancel_event is not None else lambda: False
         )
+        if is_cancelled():
+            return
+        source_info = os.stat(source_dir)
+        source_is_directory = stat.S_ISDIR(source_info.st_mode)
+        if not source_is_directory and not stat.S_ISREG(source_info.st_mode):
+            raise OSError(f"Source is not a regular file or directory: {source_dir}")
+        target_info, target_guard = inspect_target(target_dir)
+        require_readable_directory(target_guard)
+        if source_is_directory and target_is_file:
+            raise OSError(f"Cannot copy a directory to a single file: {target_dir}")
+        if target_info is not None:
+            expected_type = stat.S_ISREG if target_is_file else stat.S_ISDIR
+            if not expected_type(target_info.st_mode):
+                raise OSError(f"Target type changed: {target_dir}")
         rules = self.ignore_rules.for_pair(source_dir, target_dir, target_is_file)
         snapshots = {}
         if not verify_contents:
@@ -277,7 +292,8 @@ class SyncScanner(QObject):
             status = None
             try:
                 target_stat = os.lstat(target_path)
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
+                check_missing_error(exc)
                 status = "NEW"
             else:
                 if is_link_stat(target_stat):
@@ -317,8 +333,6 @@ class SyncScanner(QObject):
             scanned_count += 1
             report_progress()
 
-        source_is_directory = os.path.isdir(source_dir)
-
         if source_is_directory:
             stack = [(source_dir, "")]
             while stack:
@@ -348,7 +362,8 @@ class SyncScanner(QObject):
                                 source_dirs.add(relative_path_key(rel_path))
                                 try:
                                     target_stat = os.lstat(os.path.join(target_dir, rel_path))
-                                except FileNotFoundError:
+                                except FileNotFoundError as exc:
+                                    check_missing_error(exc)
                                     target_stat = None
                                 if target_stat is not None and is_link_stat(target_stat):
                                     add_difference("IGNORED_DIR", rel_path, entry.path, 0)
@@ -368,7 +383,7 @@ class SyncScanner(QObject):
                 except OSError as exc:
                     raise OSError(f"Could not scan {current_path}: {exc}") from exc
 
-        elif os.path.isfile(source_dir):
+        else:
             rel_path = os.path.basename(source_dir)
             if not ignore_source_entry(source_dir, rel_path, False, False, lambda: os.stat(source_dir)):
                 compare_source_file(source_dir, rel_path, os.stat(source_dir))
@@ -378,7 +393,7 @@ class SyncScanner(QObject):
         if (
             source_is_directory
             and not target_is_file
-            and os.path.isdir(target_dir)
+            and target_info is not None
         ):
             stack = [(target_dir, "")]
             while stack:
@@ -396,15 +411,10 @@ class SyncScanner(QObject):
                                 else entry.name
                             )
                             rel_key = relative_path_key(rel_path)
-                            try:
-                                is_directory = entry.is_dir(
-                                    follow_symlinks=False
-                                )
-                                is_link = is_directory_link(entry, is_directory)
-                                if is_link:
-                                    is_directory = is_directory or entry.is_dir()
-                            except OSError:
-                                continue
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            is_link = is_directory_link(entry, is_directory)
+                            if is_link:
+                                is_directory = is_directory or entry.is_dir()
 
                             if rules.global_matches(rel_path, is_directory):
                                 protect_parents(rel_path)
@@ -441,11 +451,14 @@ class SyncScanner(QObject):
 
                             scanned_count += 1
                             report_progress()
-                except OSError:
-                    protected_dirs.add(current_rel)
-                    protect_parents(current_rel)
-                    continue
+                except OSError as exc:
+                    raise OSError(f"Could not scan {current_path}: {exc}") from exc
 
+        if is_cancelled():
+            return
+        # Do not publish a successful comparison if a drive/share vanished.
+        os.stat(source_dir)
+        require_readable_directory(target_guard)
         for rel_path, abs_path in extra_directories:
             if is_cancelled():
                 return

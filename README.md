@@ -48,7 +48,7 @@ python main.py
 4. Click **1. Scan** to compare active pairs.
 5. Click **2. Sync** to copy confirmed changes.
 
-Temporary path changes do not write back to `config.json` automatically. Click **Save Groups** at the lower right to save all current path pairs, including file/directory target types. Language, content verification and mirror options are in **Settings**, beside **Add Grp**, and take effect when you click **Apply**. **Cancel** closes Settings and discards changes made since the last Apply. A compact transfer speed display to the left of the progress bar refreshes every half second while synchronizing and is hidden when idle.
+Temporary path changes do not write back to `config.json` automatically. Click **Save Groups** at the lower right to save all current path pairs, including file/directory target types. Language, content verification and mirror options are in **Settings**, beside **Add Grp**, and are saved when you click **Apply**, which also closes Settings. **Cancel** discards changes and closes Settings. The current filename appears between the synchronization status and transfer speed, with long names truncated on the right using `...` (hover for the full name). With parallel copies, it shows one active file. Both filename and speed refresh every half second without additional disk reads and are hidden when idle.
 
 ## Configuration
 
@@ -88,6 +88,8 @@ Temporary path changes do not write back to `config.json` automatically. Click *
 ## Notes
 
 With **Verify contents (xxHash)** enabled in **Settings**, scanning compares the current source and target: a missing target is new, a different size is modified, and equal-sized files are read completely on both sides and compared with xxHash64. Timestamps and historical snapshots do not decide whether contents match. Identical contents with different timestamps are skipped; equal sizes and timestamps cannot hide different contents. Full verification reads both sides on every scan, so large collections and network drives can take longer. xxHash64 is a fast non-cryptographic hash with a very small, nonzero collision risk. Read errors or changes detected while hashing stop the scan and prevent synchronizing partial results.
+
+Path validation runs in the background with a five-second timeout, so an unavailable NAS does not freeze the window. You can stop during this check. Missing network shares, disconnected drives, permission errors and unreadable scanned directories abort the whole scan, clear partial results and keep synchronization disabled. A genuinely missing target folder is allowed only when an existing parent directory is reachable. Connection loss during scanning is reported as an error rather than treating the destination as empty. The operating system may still take time to return an in-flight network operation after scanning has started; the UI remains responsive.
 
 Content verification is off by default, using the original fast scan based on sizes, timestamps and saved snapshots without reading file contents. This mode can miss equal-sized content changes. The Settings dialog also contains **Remove extras**; both options are saved to `config.json` and restored at startup. Settings cannot be changed while scanning or synchronizing. Long status messages are truncated on the right with an ellipsis instead of widening the window; hover over the status to read the full text.
 
@@ -203,7 +205,7 @@ python main.py
 4. 点击「1. 扫描差异」查看结果。
 5. 点击「2. 开始同步」确认后执行复制。
 
-路径组的临时调整不会自动写回 `config.json`。点击右下角的「保存组」，即可保存当前所有路径组（包括目标为文件或目录的类型）。语言、内容校验和删除多余文件选项集中在「添加组」左侧的「设置」中，点击「应用」保存并生效；「取消」关闭窗口并放弃尚未应用的修改。进度条左侧显示简洁的实时传输速度，同步时每半秒刷新，空闲时隐藏。
+路径组的临时调整不会自动写回 `config.json`。点击右下角的「保存组」，即可保存当前所有路径组（包括目标为文件或目录的类型）。语言、内容校验和删除多余文件选项集中在「添加组」左侧的「设置」中，点击左侧「应用」保存并关闭窗口；右侧「取消」放弃修改并关闭窗口。同步状态右侧、速度左侧显示当前文件名，过长时右端显示 `...`，悬停可查看完整名称；多线程复制时显示其中一个正在处理的文件。文件名和速度共用半秒刷新，不增加磁盘读取，空闲时隐藏。
 
 ## 配置文件
 
@@ -243,6 +245,8 @@ python main.py
 ## 说明
 
 在设置中开启「内容校验（xxHash）」后，扫描比较当前源文件和目标文件，目标不存在时标记为新增，大小不同时标记为修改；大小相同时完整读取两端文件，用 xxHash64 比较内容。时间戳和历史快照不决定内容是否一致。内容相同但时间不同的文件会跳过；大小和时间均相同也不会掩盖内容差异。每次扫描都会读取两端进行完整校验，大量文件和网络盘可能需要更长时间。xxHash64 是快速的非加密哈希，碰撞风险很低但不为零。读取失败或校验过程中检测到文件变化时，会中止扫描并禁止同步残缺结果。
+
+路径检查在后台运行，最多等待 5 秒，NAS 不可达时不会阻塞界面，检查期间可点击停止。网络共享不可达、磁盘断开、权限不足或扫描中的目录无法读取时，会中止整次扫描、清空不完整结果并禁止同步。只有现存父目录可以访问时，才允许目标文件夹尚未创建。扫描中断连会报错，不会把目标当成空目录。扫描开始后，已进入系统的网络访问仍可能需要等待系统返回，但界面保持响应。
 
 内容校验默认关闭，采用原来按大小、时间和已有快照进行的快速扫描，不读取文件内容，可能漏掉同大小的内容变化。设置弹窗还包含「删除多余文件」，两个选项会保存到 `config.json`，下次启动时恢复。扫描和同步期间不可更改设置。底部状态过长时在右侧显示省略号，不会撑宽窗口；悬停可查看完整文字。
 

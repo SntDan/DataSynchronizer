@@ -36,6 +36,7 @@ class CopyManager(QObject):
         self._cancel_event = CopyCancellation()
         self._cancel_event.on_bytes_copied = self._record_copied_bytes
         self._bytes_copied = 0
+        self._active_files = {}
         self.is_syncing = False
         self.failed_count = 0
         self.errors = []
@@ -64,6 +65,7 @@ class CopyManager(QObject):
         self._cancel_event.clear()
         with self._progress_lock:
             self._bytes_copied = 0
+            self._active_files.clear()
         self.failed_count = 0
         self.errors = []
         self._target_roots.clear()
@@ -181,8 +183,16 @@ class CopyManager(QObject):
         with self._progress_lock:
             self._bytes_copied += count
 
+    @property
+    def current_file_name(self):
+        with self._progress_lock:
+            # Several workers may copy at once; show the most recently started
+            # file that is still active, falling back as workers finish.
+            return next(reversed(self._active_files.values()), "")
+
     def _advance_progress(self):
         with self._progress_lock:
+            self._active_files.pop(threading.get_ident(), None)
             self.copied_count += 1
             current = self.copied_count
             now = time.monotonic()
@@ -226,6 +236,8 @@ class CopyManager(QObject):
                 rel_path, status == "EXTRA_DIR"
             ):
                 return None
+            with self._progress_lock:
+                self._active_files[threading.get_ident()] = os.path.basename(rel_path)
             if not target_is_file:
                 # A directory replaced with a junction since scanning must not
                 # redirect a write or deletion outside the configured target.
