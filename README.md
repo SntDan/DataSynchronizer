@@ -2,6 +2,8 @@
 
 [English](#english) | [中文](#中文)
 
+![DataSynchronizer scan results showing new, modified, and extra files](docs/images/data-synchronizer-scan-results.png)
+
 ---
 
 <a name="english"></a>
